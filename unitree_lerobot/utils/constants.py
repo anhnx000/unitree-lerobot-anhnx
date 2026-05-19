@@ -176,6 +176,21 @@ G1_DEX3_CONFIG = RobotConfig(
 )
 
 
+G1_DEX3_2CAM_LEFTHAND_CONFIG = RobotConfig(
+    motors=G1_DEX3_CONFIG.motors,
+    cameras=[
+        "cam_left_high",
+        "cam_left_wrist",
+    ],
+    camera_to_image_key={
+        "color_0": "cam_left_high",
+        "color_1": "cam_left_wrist",
+    },
+    json_state_data_name=G1_DEX3_CONFIG.json_state_data_name,
+    json_action_data_name=G1_DEX3_CONFIG.json_action_data_name,
+)
+
+
 G1_BRAINCO_CONFIG = RobotConfig(
     motors=[
         "kLeftShoulderPitch",
@@ -473,6 +488,7 @@ ROBOT_CONFIGS = {
     "Unitree_G1_Dex1": G1_DEX1_CONFIG,
     "Unitree_G1_Dex1_Sim": G1_DEX1_CONFIG_SIM,
     "Unitree_G1_Dex3": G1_DEX3_CONFIG,
+    "Unitree_G1_Dex3_2Cam_Lefthand": G1_DEX3_2CAM_LEFTHAND_CONFIG,
     "Unitree_G1_Brainco": G1_BRAINCO_CONFIG,
     "Unitree_G1_Inspire": G1_INSPIRE_CONFIG,
     "Unitree_G1_MoveibleLift_Dex1_UseWaist": MOVEIBLE_LIFT_G1_DEX1_USEWAIST_CONFIG,

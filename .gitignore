@@ -10,3 +10,9 @@ cam_right_wrist.jpg
 cam_left_wrist.jpg
 data/
 ./data
+
+# Large local artifacts — never push to GitHub
+data_converted/
+my-checkpoints/
+outputs/
+uv.lock
