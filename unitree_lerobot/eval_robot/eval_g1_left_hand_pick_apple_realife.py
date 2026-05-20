@@ -10,10 +10,12 @@ Closed-loop deployment on a physical G1:
   * command the left arm via arm_ctrl + arm_ik and the left hand via EE
     shared memory at --frequency Hz.
 
-Conventions (must match training):
-  * left_arm  action is RELATIVE  → integrate cumulatively on top of the
-    state at query time to obtain absolute joint targets.
-  * left_hand action is ABSOLUTE  → use directly.
+Conventions (GR00T N1.7 server, embodiment new_embodiment):
+  * Both left_arm and left_hand action keys come back ABSOLUTE because the
+    N1.7 server calls state_action_processor.unapply_action() inside
+    decode_action() (processing_gr00t_n1d7.py:312). Use chunks directly;
+    do NOT add state or cumsum on the client. Verified 2026-05-20: at ep5
+    frame 0, chunk_la[0] ≈ dataset action[0] ≈ state[0] (delta ~0.01 rad).
   * Right arm is held at its initial pose; right hand at zeros.
 
 Pre-req:
@@ -263,12 +265,12 @@ def main():
 
     # ---- Action chunk cache --------------------------------------------
     # The model returns a chunk of action_horizon predictions per query; we
-    # consume them for `--chunk-stride` steps before re-querying. left_arm is
-    # relative → we keep the raw chunk and add cumsum onto the state captured
-    # at query time. left_hand is absolute.
-    chunk_la_rel: np.ndarray | None = None    # (H, LA_DIM)
-    chunk_lh_abs: np.ndarray | None = None    # (H, LH_DIM)
-    chunk_la_anchor: np.ndarray | None = None  # left_arm state at query time
+    # consume them for `--chunk-stride` steps before re-querying. N1.7
+    # server returns ABSOLUTE joint targets for both arm and hand
+    # (state_action_processor.unapply_action runs server-side), so the chunk
+    # is used directly without anchor/cumsum manipulation.
+    chunk_la_abs: np.ndarray | None = None    # (H, LA_DIM) absolute
+    chunk_lh_abs: np.ndarray | None = None    # (H, LH_DIM) absolute
     chunk_idx = 0
 
     period = 1.0 / float(args.frequency)
@@ -309,9 +311,9 @@ def main():
 
             # ---- 2. Query policy (or reuse cached chunk) --------------
             need_query = (
-                chunk_la_rel is None
+                chunk_la_abs is None
                 or chunk_idx >= args.chunk_stride
-                or chunk_idx >= chunk_la_rel.shape[0]
+                or chunk_idx >= chunk_la_abs.shape[0]
             )
             if need_query:
                 obs = build_observation(
@@ -324,15 +326,14 @@ def main():
                 t_query_total += time.perf_counter() - tq
                 n_queries += 1
 
-                chunk_la_rel = np.asarray(action_dict["left_arm"],  dtype=np.float32).reshape(-1, LA_DIM)
+                # N1.7 server already unapplied relative→absolute server-side.
+                chunk_la_abs = np.asarray(action_dict["left_arm"],  dtype=np.float32).reshape(-1, LA_DIM)
                 chunk_lh_abs = np.asarray(action_dict["left_hand"], dtype=np.float32).reshape(-1, LH_DIM)
-                chunk_la_anchor = left_arm_state.astype(np.float32)
                 chunk_idx = 0
 
             # ---- 3. Resolve absolute target for this tick -------------
             k = chunk_idx
-            cum_rel = np.cumsum(chunk_la_rel[: k + 1], axis=0)[-1]
-            la_target_raw = chunk_la_anchor + cum_rel
+            la_target_raw = chunk_la_abs[k]
             lh_target_raw = chunk_lh_abs[k]
 
             # EMA smoothing on the executed action stream.
