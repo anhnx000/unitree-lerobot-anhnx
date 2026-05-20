@@ -172,17 +172,13 @@ def build_observation(cam_high_rgb: np.ndarray,
     Image shape: (1, 1, H, W, 3) uint8 RGB.
     State shape: (1, 1, D) float32.
     """
+    # Same observation format as eval_g1_left_hand_pick_apple_openloop.py
+    # (validated end-to-end). The server's new_embodiment modality config
+    # registers video.modality_keys = ['cam_high', 'cam_left_wrist'] — only
+    # those two are required.
     return {
         "video": {
-            # Send the mono head frame under BOTH key conventions so this
-            # script works regardless of which the GR00T server expects:
-            #   * `cam_high`       — physical observation key
-            #   * `cam_left_high`  — modality alias from meta/modality.json
-            # The server validates that all expected video keys are present
-            # and silently ignores extras. Memory cost is one extra view-
-            # reference per frame (no copy — same underlying buffer).
             "cam_high":       cam_high_rgb[None, None],
-            "cam_left_high":  cam_high_rgb[None, None],
             "cam_left_wrist": cam_left_wrist_rgb[None, None],
         },
         "state": {
@@ -377,6 +373,9 @@ class ChunkBuffer:
 
     At most one query is in flight; the next request only fires when both
     events are clear, so the worker is never starved nor doubled up.
+
+    Both arm and hand chunks are ABSOLUTE joint targets (N1.7 server
+    unapplies relative→absolute server-side).
     """
 
     def __init__(self):
@@ -385,69 +384,55 @@ class ChunkBuffer:
         self.ready_event   = threading.Event()
         # request payload (main -> worker)
         self.pending_obs:    dict | None = None
-        self.pending_anchor: np.ndarray | None = None
         self.pending_t_obs:  float = 0.0
-        # response payload (worker -> main):
-        #   la_rel = relative chunk (chunk[k] = action[t+k] - state[t_obs])
-        #   lh_abs = absolute hand targets
-        #   anchor = left_arm state at t_obs (used to recover absolute target)
-        self.ready_la_rel:  np.ndarray | None = None  # (H, LA_DIM)
+        # response payload (worker -> main): absolute (H, D) chunks
+        self.ready_la_abs:  np.ndarray | None = None  # (H, LA_DIM)
         self.ready_lh_abs:  np.ndarray | None = None  # (H, LH_DIM)
-        self.ready_anchor:  np.ndarray | None = None
         self.ready_t_obs:   float = 0.0
 
-    def submit(self, obs: dict, anchor: np.ndarray, t_obs: float) -> None:
+    def submit(self, obs: dict, t_obs: float) -> None:
         with self._lock:
-            self.pending_obs    = obs
-            self.pending_anchor = anchor
-            self.pending_t_obs  = t_obs
+            self.pending_obs   = obs
+            self.pending_t_obs = t_obs
         self.request_event.set()
 
-    def take_pending(self) -> tuple[dict, np.ndarray, float] | None:
+    def take_pending(self) -> tuple[dict, float] | None:
         with self._lock:
-            obs, anchor, t_obs = self.pending_obs, self.pending_anchor, self.pending_t_obs
-            self.pending_obs    = None
-            self.pending_anchor = None
+            obs, t_obs = self.pending_obs, self.pending_t_obs
+            self.pending_obs = None
         if obs is None:
             return None
-        return obs, anchor, t_obs
+        return obs, t_obs
 
-    def publish(self, la_rel: np.ndarray, lh_abs: np.ndarray,
-                anchor: np.ndarray, t_obs: float) -> None:
+    def publish(self, la_abs: np.ndarray, lh_abs: np.ndarray, t_obs: float) -> None:
         with self._lock:
-            self.ready_la_rel = la_rel
+            self.ready_la_abs = la_abs
             self.ready_lh_abs = lh_abs
-            self.ready_anchor = anchor
             self.ready_t_obs  = t_obs
         self.ready_event.set()
 
-    def take_ready(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, float] | None:
+    def take_ready(self) -> tuple[np.ndarray, np.ndarray, float] | None:
         with self._lock:
-            la, lh, anc, t = (self.ready_la_rel, self.ready_lh_abs,
-                              self.ready_anchor, self.ready_t_obs)
-            self.ready_la_rel = None
+            la, lh, t = self.ready_la_abs, self.ready_lh_abs, self.ready_t_obs
+            self.ready_la_abs = None
             self.ready_lh_abs = None
         if la is None:
             return None
-        return la, lh, anc, t
+        return la, lh, t
 
 
 class ChunkRing:
     """ACT-style temporal ensemble over the K most recent chunks.
 
-    Each chunk c stores:
-      * `la_rel` — absolute left_arm chunk from the N1.7 server. Named
-        `la_rel` for legacy reasons (was relative under N1.5); the server
-        now returns ABSOLUTE joint targets, so anchor is no longer needed
-        for arm reconstruction. Kept in the payload for debugging only.
-      * `lh_abs` — absolute left_hand targets.
-      * `anchor` — left_arm state at t_obs. Carried for debug; NOT used in
-        absolute target reconstruction anymore (N1.7 already unapplied).
-      * `t_obs`  — wall-clock perf_counter when the obs was captured.
+    Each chunk c stores absolute joint targets and the wall-clock time
+    the obs was captured:
+      * `la_abs` — left_arm absolute targets, shape (H, LA_DIM).
+      * `lh_abs` — left_hand absolute targets, shape (H, LH_DIM).
+      * `t_obs`  — perf_counter when the obs was captured.
 
     To compute the target for absolute time `t_now`:
       * For each chunk c that still covers t_now (idx in [0, H-1]):
-          target_la = c.la_rel[idx]   # already absolute, do NOT add anchor
+          target_la = c.la_abs[idx]
           target_lh = c.lh_abs[idx]
       * Weighted-average all contributors with w = exp(-age/tau_ticks),
         where age is in control ticks.
@@ -458,12 +443,10 @@ class ChunkRing:
         self._period = float(period)
         self._tau = float(tau_ticks)
 
-    def push(self, la_rel: np.ndarray, lh_abs: np.ndarray,
-             anchor: np.ndarray, t_obs: float) -> None:
+    def push(self, la_abs: np.ndarray, lh_abs: np.ndarray, t_obs: float) -> None:
         self._chunks.append({
-            "la_rel": la_rel.astype(np.float32, copy=False),
+            "la_abs": la_abs.astype(np.float32, copy=False),
             "lh_abs": lh_abs.astype(np.float32, copy=False),
-            "anchor": anchor.astype(np.float32, copy=False),
             "t_obs":  float(t_obs),
         })
 
@@ -489,13 +472,17 @@ class ChunkRing:
             age = (t_now - c["t_obs"]) / self._period
             if age < 0:
                 continue
-            idx = int(round(age)) - 1
-            H = c["la_rel"].shape[0]
+            # Training delta_indices = [0..H-1], so chunk[0] = action at obs-time,
+            # chunk[k] = action k ticks after obs. Apply chunk[round(age)] to align
+            # with the validated openloop convention (where chunk[0] is rendered at
+            # frame t = t_obs). Previously this had a `-1` offset that introduced a
+            # constant 1-tick lag (~50 ms @ 20 Hz) in the trajectory playback.
+            idx = int(round(age))
+            H = c["la_abs"].shape[0]
             if idx < 0 or idx >= H:
                 continue
             w = math.exp(-age / self._tau) if self._tau > 0 else 1.0
-            # N1.7 server already unapplies relative→absolute; use chunk directly.
-            la = c["la_rel"][idx]
+            la = c["la_abs"][idx]
             lh = c["lh_abs"][idx]
             if la_acc is None:
                 la_acc = w * la
@@ -512,7 +499,13 @@ class ChunkRing:
 
 def inference_worker(policy: RawPolicyClient, buffer: ChunkBuffer,
                      stop_event: threading.Event) -> None:
-    """Daemon: pull a request, query the policy, publish the chunk."""
+    """Daemon: pull a request, query the policy, publish the chunk.
+
+    N1.7 server returns ABSOLUTE targets for both arm and hand
+    (state_action_processor.unapply_action runs server-side, see
+    processing_gr00t_n1d7.py:312). Same convention as
+    eval_g1_left_hand_pick_apple_openloop.py.
+    """
     while not stop_event.is_set():
         if not buffer.request_event.wait(timeout=0.1):
             continue
@@ -520,18 +513,15 @@ def inference_worker(policy: RawPolicyClient, buffer: ChunkBuffer,
         payload = buffer.take_pending()
         if payload is None:
             continue
-        obs, anchor, t_obs = payload
+        obs, t_obs = payload
         try:
             action_dict, _ = policy.get_action(obs)
         except Exception as e:
             logger_mp.error(f"[inference] {e}")
             continue
-        # N1.7 server returns ABSOLUTE targets for both arm and hand
-        # (unapply_action runs server-side). Variable still named `la_rel`
-        # for backward compat with the ring buffer payload.
-        la_rel = np.asarray(action_dict["left_arm"],  dtype=np.float32).reshape(-1, LA_DIM)
+        la_abs = np.asarray(action_dict["left_arm"],  dtype=np.float32).reshape(-1, LA_DIM)
         lh_abs = np.asarray(action_dict["left_hand"], dtype=np.float32).reshape(-1, LH_DIM)
-        buffer.publish(la_rel, lh_abs, anchor, t_obs)
+        buffer.publish(la_abs, lh_abs, t_obs)
 
 
 def main():
@@ -711,7 +701,7 @@ def main():
             obs, current_arm_q, left_arm_state, _ = _capture_obs()
             if obs is not None:
                 first_t_obs = time.perf_counter()
-                chunk_buffer.submit(obs, left_arm_state.copy(), first_t_obs)
+                chunk_buffer.submit(obs, first_t_obs)
                 inference_busy = True
                 n_queries += 1
                 break
@@ -726,8 +716,8 @@ def main():
         inference_busy = False
         if ready is None:
             raise SystemExit("[bootstrap] ChunkBuffer.take_ready returned None")
-        boot_la, boot_lh, boot_anchor, boot_t_obs = ready
-        ring.push(boot_la, boot_lh, boot_anchor, boot_t_obs)
+        boot_la, boot_lh, boot_t_obs = ready
+        ring.push(boot_la, boot_lh, boot_t_obs)
         t_query_total += time.perf_counter() - boot_t_obs
         chunk_H = boot_la.shape[0]
         logger_mp.info(f"[bootstrap] first chunk ready in "
@@ -753,8 +743,8 @@ def main():
                 chunk_buffer.ready_event.clear()
                 inference_busy = False
                 if ready is not None:
-                    new_la, new_lh, new_anc, new_t = ready
-                    ring.push(new_la, new_lh, new_anc, new_t)
+                    new_la, new_lh, new_t = ready
+                    ring.push(new_la, new_lh, new_t)
                     t_query_total += max(0.0, loop_start - new_t)
 
             # ---- 3. Temporal-ensemble the target for THIS tick -------
@@ -815,7 +805,7 @@ def main():
                 and not chunk_buffer.ready_event.is_set()
                 and step - last_query_step >= args.query_stride_ticks
             ):
-                chunk_buffer.submit(obs, left_arm_state.copy(), loop_start)
+                chunk_buffer.submit(obs, loop_start)
                 inference_busy = True
                 n_queries += 1
                 last_query_step = step
