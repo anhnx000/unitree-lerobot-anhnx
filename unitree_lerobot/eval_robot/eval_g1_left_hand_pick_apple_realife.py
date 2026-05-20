@@ -14,9 +14,19 @@ Conventions (GR00T N1.7 server, embodiment new_embodiment):
   * Both left_arm and left_hand action keys come back ABSOLUTE because the
     N1.7 server calls state_action_processor.unapply_action() inside
     decode_action() (processing_gr00t_n1d7.py:312). Use chunks directly;
-    do NOT add state or cumsum on the client. Verified 2026-05-20: at ep5
-    frame 0, chunk_la[0] ≈ dataset action[0] ≈ state[0] (delta ~0.01 rad).
+    do NOT add state on the client.
   * Right arm is held at its initial pose; right hand at zeros.
+
+History:
+  * v1 (wrong): treated arm as `state + cumsum(chunk)` — overshoots ~10x.
+  * v2 (wrong, N1.5 era): treated arm as absolute when chunk was relative —
+    wrong scale, wrist drifted near zero.
+  * v3 (correct for N1.5): `target[k] = state_at_query + chunk[k]`, single-
+    reference relative add. Server returned raw relative chunks.
+  * v4 (correct for N1.7, current): server already unapplies relative→abs,
+    use chunk directly: `target[k] = chunk[k]`. Verified 2026-05-20: at
+    ep5 frame 0, chunk_la[0] ≈ dataset action[0] ≈ state[0] (delta ~0.01 rad)
+    confirming absolute, not relative.
 
 Pre-req:
   * GR00T policy server already running (default tcp://127.0.0.1:5555).
@@ -27,6 +37,9 @@ Pre-req:
 from __future__ import annotations
 
 import argparse
+import collections
+import math
+import threading
 import time
 from typing import Any
 
@@ -51,6 +64,37 @@ LA_DIM = 7   # left arm joints
 LH_DIM = 7   # left hand joints (dex3)
 DEFAULT_TASK = "pick apple and put in the box"
 
+# ---- Training-data init pose ---------------------------------------------
+# Mean of frame-0 left-arm state across 50 training episodes of
+# pick_and_put_v4_converted. The model expects to start the trajectory
+# from roughly this pose; if the robot starts elsewhere, the policy
+# predicts a move BACK toward this distribution (which is what causes
+# the "arm drops down" complaint when the operator holds the arm
+# perpendicular to the body before pressing 's').
+LEFT_ARM_TRAIN_INIT = np.array([
+    -0.18,   # shoulder-pitch  (slightly tilted back / up)
+    +0.04,   # shoulder-roll
+    +0.17,   # shoulder-yaw
+    +0.48,   # elbow            (bent ~27°)
+    +0.04,   # wrist-roll
+    -0.52,   # wrist-pitch
+    +0.25,   # wrist-yaw
+], dtype=np.float64)
+
+# Mean frame-0 left_hand state across 30 training episodes. Several Dex3
+# joints idle at NEGATIVE values (knuckles 0, 3, 5, 6); commanding them at
+# 0 puts the hand in an OOD pose and the policy then immediately commands
+# them back to their natural idle, which looks like the hand "shrugging".
+LEFT_HAND_TRAIN_INIT = np.array([
+    -0.46,
+    +0.80,
+    +0.04,
+    -0.50,
+    -0.08,
+    -0.49,
+    -0.09,
+], dtype=np.float64)
+
 # ---- Safety limits for the LEFT arm only (right side is untouched) -------
 # Joint position limits (rad), per Unitree G1 spec. Tightened slightly inside
 # the mechanical bounds so we never command end-stops.
@@ -60,15 +104,21 @@ DEFAULT_TASK = "pick apple and put in the box"
 LEFT_ARM_LIMITS_LOW  = np.array([-3.05, -1.55, -2.60, -1.04, -1.95, -1.60, -1.60], dtype=np.float64)
 LEFT_ARM_LIMITS_HIGH = np.array([ 2.65,  2.20,  2.60,  2.07,  1.95,  1.60,  1.60], dtype=np.float64)
 
-# Dex3 left-hand joint range (rad). Conservative — dex3 fingers operate
-# roughly in [0, 1.7]; we add a small margin.
-LEFT_HAND_LIMITS_LOW  = np.full(LH_DIM, -0.05, dtype=np.float64)
-LEFT_HAND_LIMITS_HIGH = np.full(LH_DIM,  1.75, dtype=np.float64)
+# Dex3 left-hand joint range (rad). Per-joint inspection of training data
+# shows several knuckles operate in NEGATIVE territory (down to ~-1.74),
+# so the previous [-0.05, +1.75] clamp was muzzling the fingers (they
+# couldn't actually close on objects whose grip needs a negative target).
+# Picked with ~0.3 rad margin on top of the observed training extremes.
+LEFT_HAND_LIMITS_LOW  = np.full(LH_DIM, -2.00, dtype=np.float64)
+LEFT_HAND_LIMITS_HIGH = np.full(LH_DIM,  1.50, dtype=np.float64)
 
-# Per-step velocity cap (rad/step). At 30 Hz: 0.04 rad/step ≈ 1.2 rad/s on
-# the arm, 0.10 rad/step ≈ 3 rad/s on the hand (fingers need to close fast).
-DEFAULT_ARM_DELTA_CAP  = 0.04
-DEFAULT_HAND_DELTA_CAP = 0.10
+# Per-step velocity cap (rad/step). Tuned for the default 20 Hz loop:
+#   0.027 rad/step ≈ 0.54 rad/s on the arm (gentle, safe for first deploy);
+#   0.067 rad/step ≈ 1.33 rad/s on the hand (enough for grasp open/close).
+# If you raise --frequency to 30 Hz, scale these caps by 20/30 = 0.67 so the
+# per-second velocity stays the same.
+DEFAULT_ARM_DELTA_CAP  = 0.027
+DEFAULT_HAND_DELTA_CAP = 0.067
 
 # Emergency stop: if predicted target is farther than this from the current
 # measured state, abort. Catches NaN, mis-normalized actions, or wild bias.
@@ -124,7 +174,15 @@ def build_observation(cam_high_rgb: np.ndarray,
     """
     return {
         "video": {
+            # Send the mono head frame under BOTH key conventions so this
+            # script works regardless of which the GR00T server expects:
+            #   * `cam_high`       — physical observation key
+            #   * `cam_left_high`  — modality alias from meta/modality.json
+            # The server validates that all expected video keys are present
+            # and silently ignores extras. Memory cost is one extra view-
+            # reference per frame (no copy — same underlying buffer).
             "cam_high":       cam_high_rgb[None, None],
+            "cam_left_high":  cam_high_rgb[None, None],
             "cam_left_wrist": cam_left_wrist_rgb[None, None],
         },
         "state": {
@@ -143,9 +201,12 @@ def parse_args() -> argparse.Namespace:
                     help="motion_mode passed to the arm controller.")
     ap.add_argument("--ee", default="dex3", help="end effector type")
     ap.add_argument("--image-host", default="127.0.0.1")
-    ap.add_argument("--frequency", type=float, default=30.0,
-                    help="Control loop frequency in Hz. Must match training fps "
-                         "(this model was trained at 30 Hz).")
+    ap.add_argument("--frequency", type=float, default=20.0,
+                    help="Control loop frequency in Hz. Default 20 Hz makes the "
+                         "robot execute the same predicted action chunk ~1.5x "
+                         "slower than the training rate (30 Hz) — safer for "
+                         "early real-life testing. Bump back to 30 Hz once "
+                         "behavior is verified to match the training distribution.")
     ap.add_argument("--sim", action="store_true")
     ap.add_argument("--base-type", default="legs")
 
@@ -154,11 +215,38 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--policy-port", type=int, default=5555)
     ap.add_argument("--task", default=DEFAULT_TASK)
 
-    # Action chunk handling
+    # Action chunk handling — async + ACT-style temporal ensemble
+    ap.add_argument("--ensemble-tau-ticks", type=float, default=4.0,
+                    help="Decay constant (in CONTROL TICKS) for temporal "
+                         "ensemble weights w = exp(-age/tau). ACT defaults to "
+                         "~10 ticks at 50 Hz (≈200 ms); 4 ticks at 20 Hz keeps "
+                         "the same wall-clock half-life. Lower = react faster "
+                         "to fresh chunks, higher = smoother but laggier.")
+    ap.add_argument("--ensemble-capacity", type=int, default=8,
+                    help="Max number of recent chunks kept in the ring buffer "
+                         "for temporal ensembling. Must be >= ceil(chunk_H / "
+                         "expected_query_stride) so every executable tick is "
+                         "covered by at least one chunk.")
+    ap.add_argument("--query-stride-ticks", type=int, default=1,
+                    help="Minimum control ticks between two model queries. 1 "
+                         "= fire as fast as the inference worker can keep up "
+                         "(usually ~3 ticks @ 20 Hz given 150 ms latency). "
+                         "Raise to throttle GPU load at the cost of less "
+                         "overlap in the ensemble.")
+    ap.add_argument("--hold-hz", type=float, default=50.0,
+                    help="Frequency of the daemon thread that resends the last "
+                         "command to the arm + EE controllers. Keeps the motor "
+                         "from sagging during inference latency or init pauses.")
     ap.add_argument("--chunk-stride", type=int, default=1,
-                    help="Re-query the model every N executed steps. 1 = query "
-                         "every step (highest CPU/GPU load). The server returns "
-                         "a 16-step action chunk; stride uses the first N of it.")
+                    help="DEPRECATED under temporal ensemble — no longer used. "
+                         "Kept for CLI compatibility; emits a warning if != 1.")
+    ap.add_argument("--prefetch-threshold", type=int, default=0,
+                    help="DEPRECATED under temporal ensemble — no longer used. "
+                         "Kept for CLI compatibility; emits a warning if != 0.")
+    ap.add_argument("--play-delay-ticks", type=int, default=0,
+                    help="DEPRECATED under temporal ensemble — the ensemble "
+                         "weights handle latency masking. Kept for CLI "
+                         "compatibility; emits a warning if != 0.")
 
     # Smoothing — alpha=0.5 was the best result from the openloop sweep.
     ap.add_argument("--ema-alpha", type=float, default=0.5,
@@ -181,6 +269,16 @@ def parse_args() -> argparse.Namespace:
                          "first predicted target over this many control steps.")
     ap.add_argument("--disable-safety", action="store_true",
                     help="DANGEROUS: disable joint-limit + delta-cap + abort checks.")
+    ap.add_argument("--init-pose", choices=["current", "training"], default="training",
+                    help="'training' (default): move left arm to the training-data "
+                         "frame-0 pose before the loop starts — required so the "
+                         "policy sees in-distribution state. 'current': use whatever "
+                         "pose the robot is in (matches the old behavior; only use "
+                         "if you have manually placed the arm at a training-like pose).")
+    ap.add_argument("--init-pose-secs", type=float, default=2.0,
+                    help="Time (seconds) over which the left arm slews from its "
+                         "current pose to LEFT_ARM_TRAIN_INIT before the closed-loop "
+                         "starts. Slower = safer.")
     return ap.parse_args()
 
 
@@ -209,12 +307,257 @@ def safety_clamp(target: np.ndarray, current: np.ndarray,
     return clamped, False, ""
 
 
+class ControlState:
+    """Thread-shared command target. Updated by main loop / slew, read by
+    the hold-pose daemon which is the SOLE writer to the arm + EE hardware.
+
+    Centralizing hardware writes in one thread (a) gives a continuous command
+    stream so the G1 controller never sees a >100ms gap (avoids gravity sag),
+    and (b) removes any chance of two threads racing on ctrl_dual_arm().
+    """
+
+    def __init__(self, arm_full_cmd: np.ndarray, arm_ik,
+                 left_hand_cmd: np.ndarray, right_hand_cmd: np.ndarray):
+        self._lock = threading.Lock()
+        self._arm = np.asarray(arm_full_cmd, dtype=np.float64).copy()
+        self._tau = np.asarray(arm_ik.solve_tau(self._arm), dtype=np.float64).copy()
+        self._lh  = np.asarray(left_hand_cmd, dtype=np.float64).copy()
+        self._rh  = np.asarray(right_hand_cmd, dtype=np.float64).copy()
+        self._arm_ik = arm_ik
+
+    def set_arm(self, full_cmd: np.ndarray) -> None:
+        full_cmd = np.asarray(full_cmd, dtype=np.float64)
+        tau = np.asarray(self._arm_ik.solve_tau(full_cmd), dtype=np.float64)
+        with self._lock:
+            self._arm = full_cmd
+            self._tau = tau
+
+    def set_hands(self, left: np.ndarray, right: np.ndarray) -> None:
+        left  = np.asarray(left,  dtype=np.float64)
+        right = np.asarray(right, dtype=np.float64)
+        with self._lock:
+            self._lh = left
+            self._rh = right
+
+    def snapshot(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        with self._lock:
+            return (self._arm.copy(), self._tau.copy(),
+                    self._lh.copy(),  self._rh.copy())
+
+
+def hold_pose_loop(arm_ctrl, ee_shared, ctrl_state: ControlState,
+                   stop_event: threading.Event, hz: float) -> None:
+    """Daemon: resend the latest command to arm + EE at fixed rate.
+
+    Runs faster than the control loop so even during a slow tick (model query,
+    OS jitter, image stall) the motor still gets a fresh command every ~20ms.
+    """
+    period = 1.0 / float(hz)
+    while not stop_event.is_set():
+        t = time.perf_counter()
+        try:
+            arm_cmd, arm_tau, lh, rh = ctrl_state.snapshot()
+            arm_ctrl.ctrl_dual_arm(arm_cmd, arm_tau)
+            if ee_shared:
+                with ee_shared["lock"]:
+                    ee_shared["left"][:]  = lh.tolist()
+                    ee_shared["right"][:] = rh.tolist()
+        except Exception as e:
+            logger_mp.error(f"[hold] {e}")
+        time.sleep(max(0.0, period - (time.perf_counter() - t)))
+
+
+class ChunkBuffer:
+    """Single-slot async pipeline for GR00T action chunks.
+
+    Main loop:  fills `pending_*`, sets `request_event`.
+    Worker:     drains pending, runs policy.get_action, fills `ready_*`,
+                sets `ready_event`.
+    Main loop:  swaps `ready_*` into its local cache, clears `ready_event`.
+
+    At most one query is in flight; the next request only fires when both
+    events are clear, so the worker is never starved nor doubled up.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.request_event = threading.Event()
+        self.ready_event   = threading.Event()
+        # request payload (main -> worker)
+        self.pending_obs:    dict | None = None
+        self.pending_anchor: np.ndarray | None = None
+        self.pending_t_obs:  float = 0.0
+        # response payload (worker -> main):
+        #   la_rel = relative chunk (chunk[k] = action[t+k] - state[t_obs])
+        #   lh_abs = absolute hand targets
+        #   anchor = left_arm state at t_obs (used to recover absolute target)
+        self.ready_la_rel:  np.ndarray | None = None  # (H, LA_DIM)
+        self.ready_lh_abs:  np.ndarray | None = None  # (H, LH_DIM)
+        self.ready_anchor:  np.ndarray | None = None
+        self.ready_t_obs:   float = 0.0
+
+    def submit(self, obs: dict, anchor: np.ndarray, t_obs: float) -> None:
+        with self._lock:
+            self.pending_obs    = obs
+            self.pending_anchor = anchor
+            self.pending_t_obs  = t_obs
+        self.request_event.set()
+
+    def take_pending(self) -> tuple[dict, np.ndarray, float] | None:
+        with self._lock:
+            obs, anchor, t_obs = self.pending_obs, self.pending_anchor, self.pending_t_obs
+            self.pending_obs    = None
+            self.pending_anchor = None
+        if obs is None:
+            return None
+        return obs, anchor, t_obs
+
+    def publish(self, la_rel: np.ndarray, lh_abs: np.ndarray,
+                anchor: np.ndarray, t_obs: float) -> None:
+        with self._lock:
+            self.ready_la_rel = la_rel
+            self.ready_lh_abs = lh_abs
+            self.ready_anchor = anchor
+            self.ready_t_obs  = t_obs
+        self.ready_event.set()
+
+    def take_ready(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, float] | None:
+        with self._lock:
+            la, lh, anc, t = (self.ready_la_rel, self.ready_lh_abs,
+                              self.ready_anchor, self.ready_t_obs)
+            self.ready_la_rel = None
+            self.ready_lh_abs = None
+        if la is None:
+            return None
+        return la, lh, anc, t
+
+
+class ChunkRing:
+    """ACT-style temporal ensemble over the K most recent chunks.
+
+    Each chunk c stores:
+      * `la_rel` — absolute left_arm chunk from the N1.7 server. Named
+        `la_rel` for legacy reasons (was relative under N1.5); the server
+        now returns ABSOLUTE joint targets, so anchor is no longer needed
+        for arm reconstruction. Kept in the payload for debugging only.
+      * `lh_abs` — absolute left_hand targets.
+      * `anchor` — left_arm state at t_obs. Carried for debug; NOT used in
+        absolute target reconstruction anymore (N1.7 already unapplied).
+      * `t_obs`  — wall-clock perf_counter when the obs was captured.
+
+    To compute the target for absolute time `t_now`:
+      * For each chunk c that still covers t_now (idx in [0, H-1]):
+          target_la = c.la_rel[idx]   # already absolute, do NOT add anchor
+          target_lh = c.lh_abs[idx]
+      * Weighted-average all contributors with w = exp(-age/tau_ticks),
+        where age is in control ticks.
+    """
+
+    def __init__(self, capacity: int, period: float, tau_ticks: float):
+        self._chunks: collections.deque = collections.deque(maxlen=max(1, capacity))
+        self._period = float(period)
+        self._tau = float(tau_ticks)
+
+    def push(self, la_rel: np.ndarray, lh_abs: np.ndarray,
+             anchor: np.ndarray, t_obs: float) -> None:
+        self._chunks.append({
+            "la_rel": la_rel.astype(np.float32, copy=False),
+            "lh_abs": lh_abs.astype(np.float32, copy=False),
+            "anchor": anchor.astype(np.float32, copy=False),
+            "t_obs":  float(t_obs),
+        })
+
+    def __len__(self) -> int:
+        return len(self._chunks)
+
+    def newest_age_ticks(self, t_now: float) -> float | None:
+        if not self._chunks:
+            return None
+        return (t_now - self._chunks[-1]["t_obs"]) / self._period
+
+    def ensemble(self, t_now: float) -> tuple[np.ndarray | None, np.ndarray | None, int]:
+        """Weighted average of all covering chunks' absolute targets at t_now.
+
+        Returns (la_target, lh_target, n_contributing). If no chunk covers
+        t_now (all expired or none yet pushed), returns (None, None, 0).
+        """
+        la_acc: np.ndarray | None = None
+        lh_acc: np.ndarray | None = None
+        w_total = 0.0
+        n = 0
+        for c in self._chunks:
+            age = (t_now - c["t_obs"]) / self._period
+            if age < 0:
+                continue
+            idx = int(round(age)) - 1
+            H = c["la_rel"].shape[0]
+            if idx < 0 or idx >= H:
+                continue
+            w = math.exp(-age / self._tau) if self._tau > 0 else 1.0
+            # N1.7 server already unapplies relative→absolute; use chunk directly.
+            la = c["la_rel"][idx]
+            lh = c["lh_abs"][idx]
+            if la_acc is None:
+                la_acc = w * la
+                lh_acc = w * lh
+            else:
+                la_acc = la_acc + w * la
+                lh_acc = lh_acc + w * lh
+            w_total += w
+            n += 1
+        if la_acc is None or w_total == 0.0:
+            return None, None, 0
+        return la_acc / w_total, lh_acc / w_total, n
+
+
+def inference_worker(policy: RawPolicyClient, buffer: ChunkBuffer,
+                     stop_event: threading.Event) -> None:
+    """Daemon: pull a request, query the policy, publish the chunk."""
+    while not stop_event.is_set():
+        if not buffer.request_event.wait(timeout=0.1):
+            continue
+        buffer.request_event.clear()
+        payload = buffer.take_pending()
+        if payload is None:
+            continue
+        obs, anchor, t_obs = payload
+        try:
+            action_dict, _ = policy.get_action(obs)
+        except Exception as e:
+            logger_mp.error(f"[inference] {e}")
+            continue
+        # N1.7 server returns ABSOLUTE targets for both arm and hand
+        # (unapply_action runs server-side). Variable still named `la_rel`
+        # for backward compat with the ring buffer payload.
+        la_rel = np.asarray(action_dict["left_arm"],  dtype=np.float32).reshape(-1, LA_DIM)
+        lh_abs = np.asarray(action_dict["left_hand"], dtype=np.float32).reshape(-1, LH_DIM)
+        buffer.publish(la_rel, lh_abs, anchor, t_obs)
+
+
 def main():
     args = parse_args()
 
     if not (0.0 < args.ema_alpha <= 1.0):
         raise SystemExit(f"--ema-alpha must be in (0, 1], got {args.ema_alpha}")
     alpha = float(args.ema_alpha)
+
+    for deprecated_name, val, default in (
+        ("--chunk-stride", args.chunk_stride, 1),
+        ("--prefetch-threshold", args.prefetch_threshold, 0),
+        ("--play-delay-ticks", args.play_delay_ticks, 0),
+    ):
+        if val != default:
+            logger_mp.warning(
+                f"{deprecated_name}={val} is deprecated under the temporal "
+                f"ensemble architecture and is ignored. Use --ensemble-tau-ticks "
+                f"and --query-stride-ticks instead.")
+
+    if args.ensemble_tau_ticks <= 0:
+        raise SystemExit(f"--ensemble-tau-ticks must be > 0, got {args.ensemble_tau_ticks}")
+    if args.ensemble_capacity < 1:
+        raise SystemExit(f"--ensemble-capacity must be >= 1, got {args.ensemble_capacity}")
+    if args.query_stride_ticks < 1:
+        raise SystemExit(f"--query-stride-ticks must be >= 1, got {args.query_stride_ticks}")
 
     # ---- GR00T server ----------------------------------------------------
     policy = RawPolicyClient(args.policy_host, args.policy_port, timeout_ms=60000)
@@ -236,107 +579,193 @@ def main():
     if ee_dof != LH_DIM:
         raise SystemExit(f"ee_dof={ee_dof} does not match left_hand dim {LH_DIM}")
 
-    # ---- Initial pose: hold current arm pose, zero left hand ------------
-    current_full_arm = arm_ctrl.get_current_dual_arm_q()
-    init_full_arm = np.asarray(current_full_arm, dtype=np.float64).copy()
-    logger_mp.info(f"[init] dual_arm_q={init_full_arm.tolist()}")
+    # ---- Initial pose: snap left arm to training-data init -------------
+    # We must put the left arm into a pose the policy actually saw during
+    # training before we let it close the loop. Right arm is left alone.
+    current_full_arm = np.asarray(arm_ctrl.get_current_dual_arm_q(), dtype=np.float64)
+    init_full_arm = current_full_arm.copy()
+    if args.init_pose == "training":
+        init_full_arm[:LA_DIM] = LEFT_ARM_TRAIN_INIT
+    logger_mp.info(
+        f"[init] mode={args.init_pose}  "
+        f"current_left_arm={current_full_arm[:LA_DIM].tolist()}  "
+        f"target_left_arm={init_full_arm[:LA_DIM].tolist()}"
+    )
 
     user_input = input("Enter 's' to start closed-loop GR00T evaluation: ")
     if user_input.lower() != "s":
         logger_mp.info("aborted by user")
         return
 
-    # Move to initial pose explicitly so the first action is well-defined.
-    tau = arm_ik.solve_tau(init_full_arm)
-    arm_ctrl.ctrl_dual_arm(init_full_arm, tau)
-    time.sleep(1.0)
-
-    # Initialize left hand at zero (closed depends on dex3 zero pose — adjust
-    # if your hand convention differs).
-    left_hand_zero = np.zeros(LH_DIM, dtype=np.float64)
-    right_hand_zero = np.zeros(LH_DIM, dtype=np.float64)
+    # ---- Threading setup -----------------------------------------------
+    # Start the hold-pose daemon BEFORE the slew so the motor is fed a
+    # continuous command stream end-to-end (init → slew → settle → loop →
+    # inference gaps). The control loop never touches the hardware directly;
+    # it only updates ctrl_state.
+    # Read the actual current left_hand pose so the slew doesn't start
+    # from `0` (which is OOD — see LEFT_HAND_TRAIN_INIT comment).
     with ee_shared["lock"]:
-        ee_shared["left"][:]  = left_hand_zero.tolist()
-        ee_shared["right"][:] = right_hand_zero.tolist()
+        full_ee_state_init = np.array(ee_shared["state"][:], dtype=np.float64)
+    current_left_hand  = full_ee_state_init[:LH_DIM].copy()
+    right_hand_zero    = np.zeros(LH_DIM, dtype=np.float64)
+    ctrl_state = ControlState(current_full_arm, arm_ik, current_left_hand, right_hand_zero)
 
-    # ---- EMA state -------------------------------------------------------
-    ema_la: np.ndarray | None = None
-    ema_lh: np.ndarray | None = None
+    stop_event = threading.Event()
+    chunk_buffer = ChunkBuffer()
 
-    # ---- Action chunk cache --------------------------------------------
-    # The model returns a chunk of action_horizon predictions per query; we
-    # consume them for `--chunk-stride` steps before re-querying. N1.7
-    # server returns ABSOLUTE joint targets for both arm and hand
-    # (state_action_processor.unapply_action runs server-side), so the chunk
-    # is used directly without anchor/cumsum manipulation.
-    chunk_la_abs: np.ndarray | None = None    # (H, LA_DIM) absolute
-    chunk_lh_abs: np.ndarray | None = None    # (H, LH_DIM) absolute
-    chunk_idx = 0
+    hold_thread = threading.Thread(
+        target=hold_pose_loop,
+        args=(arm_ctrl, ee_shared, ctrl_state, stop_event, args.hold_hz),
+        name="hold-pose", daemon=True,
+    )
+    infer_thread = threading.Thread(
+        target=inference_worker,
+        args=(policy, chunk_buffer, stop_event),
+        name="gr00t-infer", daemon=True,
+    )
+    hold_thread.start()
+    infer_thread.start()
+    logger_mp.info(f"[threads] hold@{args.hold_hz:.0f}Hz + gr00t-infer started")
 
     period = 1.0 / float(args.frequency)
-    logger_mp.info(f"[run] control loop at {args.frequency:.1f} Hz, alpha={alpha:.2f}, "
-                   f"chunk_stride={args.chunk_stride}")
-
-    step = 0
     n_queries = 0
     t_query_total = 0.0
-    try:
-        while True:
-            loop_start = time.perf_counter()
+    step = 0
 
-            # ---- 1. Observation ---------------------------------------
+    try:
+        # ---- Slew left arm to training-data init via ctrl_state --------
+        # The hold thread keeps resending whatever ctrl_state currently
+        # holds, so we only need to advance the target pose at the control
+        # rate — no direct ctrl_dual_arm() calls from this thread.
+        n_init_steps = max(1, int(round(args.init_pose_secs * args.frequency)))
+        start_left = current_full_arm[:LA_DIM].copy()
+        end_left   = init_full_arm[:LA_DIM].copy()
+        start_lh   = current_left_hand.copy()
+        end_lh     = LEFT_HAND_TRAIN_INIT.copy() if args.init_pose == "training" else current_left_hand.copy()
+        logger_mp.info(f"[init] slewing left arm + left hand over {n_init_steps} steps "
+                       f"({args.init_pose_secs:.1f}s @ {args.frequency:.1f}Hz)  "
+                       f"hand: {start_lh.tolist()} -> {end_lh.tolist()}")
+        for i in range(1, n_init_steps + 1):
+            t = time.perf_counter()
+            w = i / float(n_init_steps)
+            cmd = init_full_arm.copy()
+            cmd[:LA_DIM] = (1.0 - w) * start_left + w * end_left
+            ctrl_state.set_arm(cmd)
+            cur_lh = (1.0 - w) * start_lh + w * end_lh
+            ctrl_state.set_hands(cur_lh, right_hand_zero)
+            time.sleep(max(0.0, period - (time.perf_counter() - t)))
+        ctrl_state.set_arm(init_full_arm)
+        ctrl_state.set_hands(end_lh, right_hand_zero)
+        time.sleep(0.3)  # settle — hold thread keeps commanding init pose
+
+        # ---- EMA + temporal-ensemble state ----------------------------
+        ema_la: np.ndarray | None = None
+        ema_lh: np.ndarray | None = None
+        ring = ChunkRing(
+            capacity=int(args.ensemble_capacity),
+            period=period,
+            tau_ticks=float(args.ensemble_tau_ticks),
+        )
+        inference_busy: bool = False
+        last_query_step = -10**9   # ensure first prefetch fires immediately
+
+        logger_mp.info(
+            f"[run] control loop @ {args.frequency:.1f}Hz  alpha={alpha:.2f}  "
+            f"ensemble_tau_ticks={args.ensemble_tau_ticks}  "
+            f"ensemble_capacity={args.ensemble_capacity}  "
+            f"query_stride_ticks={args.query_stride_ticks}"
+        )
+
+        # ---- Bootstrap first chunk ------------------------------------
+        # Fire the first query NOW so we have something to play when the
+        # loop starts. The hold thread keeps the arm at init_full_arm
+        # during this wait — no sag.
+        def _capture_obs() -> tuple[dict | None, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
             observation, current_arm_q = process_images_and_observations(
                 image_client, image_config, arm_ctrl
             )
             if current_arm_q is None:
-                logger_mp.warning("arm state unavailable, skipping step")
-                time.sleep(period)
-                continue
+                return None, None, None, None
             current_arm_q = np.asarray(current_arm_q, dtype=np.float64)
             left_arm_state = current_arm_q[:LA_DIM].astype(np.float32)
-
             with ee_shared["lock"]:
                 full_ee_state = np.array(ee_shared["state"][:], dtype=np.float64)
             left_hand_state = full_ee_state[:LH_DIM].astype(np.float32)
-
-            # Images: process_images_and_observations returns torch tensors HxWx3 RGB.
-            cam_high_t = observation.get("observation.images.cam_left_high", None)
+            cam_high_t = observation.get("observation.images.cam_high")
+            if cam_high_t is None:
+                cam_high_t = observation.get("observation.images.cam_left_high")
             cam_wrist_t = observation.get("observation.images.cam_left_wrist", None)
             if cam_high_t is None or cam_wrist_t is None:
-                logger_mp.warning("missing camera frame, skipping step")
-                time.sleep(period)
-                continue
+                return None, current_arm_q, left_arm_state, full_ee_state
             cam_high_rgb  = cam_high_t.numpy().astype(np.uint8)
             cam_wrist_rgb = cam_wrist_t.numpy().astype(np.uint8)
-
-            # ---- 2. Query policy (or reuse cached chunk) --------------
-            need_query = (
-                chunk_la_abs is None
-                or chunk_idx >= args.chunk_stride
-                or chunk_idx >= chunk_la_abs.shape[0]
+            obs = build_observation(
+                cam_high_rgb, cam_wrist_rgb,
+                left_arm_state, left_hand_state, args.task,
             )
-            if need_query:
-                obs = build_observation(
-                    cam_high_rgb, cam_wrist_rgb,
-                    left_arm_state, left_hand_state,
-                    args.task,
-                )
-                tq = time.perf_counter()
-                action_dict, _ = policy.get_action(obs)
-                t_query_total += time.perf_counter() - tq
+            return obs, current_arm_q, left_arm_state, full_ee_state
+
+        bootstrap_deadline = time.perf_counter() + 5.0
+        first_t_obs = 0.0
+        while time.perf_counter() < bootstrap_deadline:
+            obs, current_arm_q, left_arm_state, _ = _capture_obs()
+            if obs is not None:
+                first_t_obs = time.perf_counter()
+                chunk_buffer.submit(obs, left_arm_state.copy(), first_t_obs)
+                inference_busy = True
                 n_queries += 1
+                break
+            time.sleep(0.05)
+        else:
+            raise SystemExit("[bootstrap] failed to capture obs for first query within 5s")
 
-                # N1.7 server already unapplied relative→absolute server-side.
-                chunk_la_abs = np.asarray(action_dict["left_arm"],  dtype=np.float32).reshape(-1, LA_DIM)
-                chunk_lh_abs = np.asarray(action_dict["left_hand"], dtype=np.float32).reshape(-1, LH_DIM)
-                chunk_idx = 0
+        if not chunk_buffer.ready_event.wait(timeout=10.0):
+            raise SystemExit("[bootstrap] GR00T server did not return first chunk within 10s")
+        ready = chunk_buffer.take_ready()
+        chunk_buffer.ready_event.clear()
+        inference_busy = False
+        if ready is None:
+            raise SystemExit("[bootstrap] ChunkBuffer.take_ready returned None")
+        boot_la, boot_lh, boot_anchor, boot_t_obs = ready
+        ring.push(boot_la, boot_lh, boot_anchor, boot_t_obs)
+        t_query_total += time.perf_counter() - boot_t_obs
+        chunk_H = boot_la.shape[0]
+        logger_mp.info(f"[bootstrap] first chunk ready in "
+                       f"{1000*(time.perf_counter()-boot_t_obs):.0f}ms, H={chunk_H}")
 
-            # ---- 3. Resolve absolute target for this tick -------------
-            k = chunk_idx
-            la_target_raw = chunk_la_abs[k]
-            lh_target_raw = chunk_lh_abs[k]
+        # ---- Main control loop --------------------------------------
+        last_la_cmd = init_full_arm[:LA_DIM].copy()
+        last_lh_cmd = end_lh.copy()
+        while True:
+            loop_start = time.perf_counter()
 
-            # EMA smoothing on the executed action stream.
+            # ---- 1. Capture obs / state (cheap; needed for safety) ---
+            obs, current_arm_q, left_arm_state, full_ee_state = _capture_obs()
+            if current_arm_q is None:
+                logger_mp.warning("arm state unavailable, skipping step")
+                time.sleep(period)
+                continue
+            left_hand_state = full_ee_state[:LH_DIM].astype(np.float32)
+
+            # ---- 2. Push any freshly-arrived chunk into the ring -----
+            if chunk_buffer.ready_event.is_set():
+                ready = chunk_buffer.take_ready()
+                chunk_buffer.ready_event.clear()
+                inference_busy = False
+                if ready is not None:
+                    new_la, new_lh, new_anc, new_t = ready
+                    ring.push(new_la, new_lh, new_anc, new_t)
+                    t_query_total += max(0.0, loop_start - new_t)
+
+            # ---- 3. Temporal-ensemble the target for THIS tick -------
+            la_target_raw, lh_target_raw, n_contrib = ring.ensemble(loop_start)
+            if la_target_raw is None:
+                # No chunk covers this tick — every recent chunk has run
+                # out and the worker hasn't published a fresh one in time.
+                # Hold the last sent command (hold thread keeps motor fed).
+                la_target_raw = last_la_cmd.astype(np.float32)
+                lh_target_raw = last_lh_cmd.astype(np.float32)
+
             if ema_la is None:
                 ema_la = la_target_raw.copy()
                 ema_lh = lh_target_raw.copy()
@@ -347,16 +776,13 @@ def main():
             la_cmd = ema_la.astype(np.float64)
             lh_cmd = ema_lh.astype(np.float64)
 
-            # ---- 3b. Soft-start ramp (left side only) ----------------
-            # Linearly blend from the current measured state toward the
-            # predicted target over the first --ramp-steps ticks so the
-            # robot doesn't snap to whatever the policy says on frame 0.
+            # ---- 3b. Soft-start ramp (first --ramp-steps ticks) ------
             if step < args.ramp_steps:
                 w = (step + 1) / float(args.ramp_steps)
                 la_cmd = (1.0 - w) * left_arm_state.astype(np.float64) + w * la_cmd
                 lh_cmd = (1.0 - w) * left_hand_state.astype(np.float64) + w * lh_cmd
 
-            # ---- 3c. Safety clamps (left arm + left hand only) -------
+            # ---- 3c. Safety clamps ----------------------------------
             if not args.disable_safety:
                 la_cmd, abort_a, reason_a = safety_clamp(
                     la_cmd, current_arm_q[:LA_DIM],
@@ -372,21 +798,47 @@ def main():
                     logger_mp.error(f"[SAFETY ABORT] {reason_a or reason_h}")
                     break
 
-            # ---- 4. Send to robot -------------------------------------
+            # ---- 4. Publish target to hold thread --------------------
             arm_cmd = init_full_arm.copy()             # right arm stays at init
             arm_cmd[:LA_DIM] = la_cmd
-            tau = arm_ik.solve_tau(arm_cmd)
-            arm_ctrl.ctrl_dual_arm(arm_cmd, tau)
+            ctrl_state.set_arm(arm_cmd)
+            ctrl_state.set_hands(lh_cmd, right_hand_zero)
+            last_la_cmd = la_cmd.copy()
+            last_lh_cmd = lh_cmd.copy()
 
-            with ee_shared["lock"]:
-                ee_shared["left"][:]  = lh_cmd.tolist()
-                ee_shared["right"][:] = right_hand_zero.tolist()
+            # ---- 5. Fire next prefetch if worker is idle -------------
+            # Stride limit + worker-free gating naturally caps query rate
+            # to the lesser of (1 / inference_latency) and frequency / stride.
+            if (
+                obs is not None
+                and not inference_busy
+                and not chunk_buffer.ready_event.is_set()
+                and step - last_query_step >= args.query_stride_ticks
+            ):
+                chunk_buffer.submit(obs, left_arm_state.copy(), loop_start)
+                inference_busy = True
+                n_queries += 1
+                last_query_step = step
 
-            chunk_idx += 1
             step += 1
-            if step % 30 == 0:
+            if step % 15 == 0:
                 avg_q = 1000 * t_query_total / max(n_queries, 1)
-                logger_mp.info(f"  step {step}  queries={n_queries}  avg_query={avg_q:.1f} ms")
+                newest_age = ring.newest_age_ticks(time.perf_counter())
+                # Wrist joints: 4=roll, 5=pitch, 6=yaw. Print model RAW
+                # target, after-EMA cmd, and measured state. Drift = cmd
+                # diverging from training range  ([-0.2,+0.3], [-0.7,-0.1],
+                # [-0.15,+0.4]).
+                logger_mp.info(
+                    f"  step {step:>4}  q={n_queries}  avg_q={avg_q:.0f}ms  "
+                    f"ring={len(ring)}  ens_n={n_contrib}  "
+                    f"newest_age={newest_age:.1f}t"
+                )
+                logger_mp.info(
+                    f"           wrist target raw "
+                    f"roll={la_target_raw[4]:+.3f} pitch={la_target_raw[5]:+.3f} yaw={la_target_raw[6]:+.3f}  "
+                    f"| cmd roll={la_cmd[4]:+.3f} pitch={la_cmd[5]:+.3f} yaw={la_cmd[6]:+.3f}  "
+                    f"| state roll={left_arm_state[4]:+.3f} pitch={left_arm_state[5]:+.3f} yaw={left_arm_state[6]:+.3f}"
+                )
 
             if args.max_steps is not None and step >= args.max_steps:
                 logger_mp.info(f"reached max_steps={args.max_steps}, stopping")
@@ -400,6 +852,9 @@ def main():
     except Exception as e:
         logger_mp.error(f"run failed: {e}", exc_info=True)
     finally:
+        stop_event.set()
+        hold_thread.join(timeout=2.0)
+        infer_thread.join(timeout=2.0)
         logger_mp.info(f"[done] steps={step}  queries={n_queries}")
 
 
