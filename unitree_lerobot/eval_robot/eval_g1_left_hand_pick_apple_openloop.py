@@ -12,11 +12,18 @@ Outputs:
   * <out-dir>/openloop_ep{N}_left_hand.png
   * RMSE / L2 summary on stdout.
 
-The arm/hand convention:
-  * left_arm  action is RELATIVE  → integrate cumulatively on top of the
-    state at query time to obtain absolute joint targets, then compare to
-    the dataset's absolute action.
-  * left_hand action is ABSOLUTE  → compare directly.
+The arm/hand convention for GR00T N1.7 server:
+  * Server's decode_action (processing_gr00t_n1d7.py:312) calls
+    state_action_processor.unapply_action which already adds the reference
+    state to the relative chunk → response keys carry ABSOLUTE joint targets.
+  * Therefore: do NOT add state again. Both `action["left_arm"]` and
+    `action["left_hand"]` are absolute and used directly.
+
+History:
+  * v1 (wrong): used `state + cumsum(chunk)` — overshoots ~10x.
+  * v2 (wrong, N1.5 era): treated chunk as absolute when it was relative — wrong scale.
+  * v3 (correct for N1.5): `state + chunk[k]` — server returned raw relative.
+  * v4 (correct for N1.7, current): use chunk directly — server already unapplied.
 
 Pre-req: GR00T policy server already running, env `unitree_lerobot_clean`.
 """
@@ -261,7 +268,11 @@ def main():
 
         chunk_la = np.asarray(action_dict["left_arm"],  dtype=np.float32).reshape(-1, 7)
         chunk_lh = np.asarray(action_dict["left_hand"], dtype=np.float32).reshape(-1, 7)
-        abs_la_chunk = st[LA_SLICE][None, :] + np.cumsum(chunk_la, axis=0)   # (16, 7) absolute
+        # N1.7 server already calls state_action_processor.unapply_action inside
+        # decode_action (processing_gr00t_n1d7.py:312), so both arm and hand
+        # come back as ABSOLUTE joint targets. Do NOT add state again — that was
+        # the N1.5 convention where the server returned raw relative chunks.
+        abs_la_chunk = chunk_la                                              # (16, 7) absolute
         abs_lh_chunk = chunk_lh                                              # (16, 7) absolute
 
         # Fill the stride-window from this query, applying EMA smoothing
