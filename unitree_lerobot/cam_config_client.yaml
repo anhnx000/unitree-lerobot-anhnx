@@ -1,32 +1,35 @@
 head_camera:
-  type: opencv
-  video_id: 0
+  type: realsense
+  serial_number: '243722071431'
   image_shape:
   - 480
-  - 1280
+  - 640
   fps: 30
-  enable_zmq: false
+  binocular: false
+  enable_zmq: true
   zmq_port: 55555
   enable_webrtc: false
   webrtc_port: 66666
 left_wrist_camera:
-  type: opencv
-  video_id: 2
+  type: realsense
+  serial_number: '335122270157'
   image_shape:
   - 480
   - 640
   fps: 30
-  enable_zmq: false
+  binocular: false
+  enable_zmq: true
   zmq_port: 55556
   enable_webrtc: false
   webrtc_port: 66667
 right_wrist_camera:
-  type: opencv
-  video_id: 4
+  type: realsense
+  serial_number: ''
   image_shape:
   - 480
   - 640
   fps: 30
+  binocular: false
   enable_zmq: false
   zmq_port: 55557
   enable_webrtc: false

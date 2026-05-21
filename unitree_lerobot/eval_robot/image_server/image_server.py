@@ -1062,16 +1062,28 @@ class UVCCamera(BaseCamera):
         logger_mp.info(f"[UVCCamera] Released {self._cam_topic}")
 
 class OpenCVCamera(BaseCamera):
-    def __init__(self, cam_topic, video_path, img_shape, fps, 
-                 enable_zmq=True, zmq_port=55555, enable_webrtc=False, webrtc_port=66666, webrtc_codec=None):
+    def __init__(self, cam_topic, video_path, img_shape, fps,
+                 enable_zmq=True, zmq_port=55555, enable_webrtc=False, webrtc_port=66666, webrtc_codec=None,
+                 fourcc="MJPG"):
         super().__init__(cam_topic, img_shape, fps, enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
         self._video_path = video_path
 
-        self.cap = cv2.VideoCapture(self._video_path, cv2.CAP_V4L2)
-        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._img_shape[0])
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self._img_shape[1])
-        self.cap.set(cv2.CAP_PROP_FPS, self._fps)
+        # If fourcc is None / "default" / "" the camera is opened in its
+        # native pixel format and the requested resolution is NOT forced.
+        # This is required for Intel RealSense exposed via plain V4L2:
+        # forcing FOURCC or calling set(WIDTH/HEIGHT) before the first read
+        # causes the device to refuse to deliver frames.
+        force_format = bool(fourcc) and fourcc not in ("default", "DEFAULT")
+        self.cap = (
+            cv2.VideoCapture(self._video_path, cv2.CAP_V4L2)
+            if force_format
+            else cv2.VideoCapture(self._video_path)
+        )
+        if force_format:
+            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._img_shape[0])
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self._img_shape[1])
+            self.cap.set(cv2.CAP_PROP_FPS, self._fps)
 
         # Test if the camera can read frames
         if not self._can_read_frame():
@@ -1229,8 +1241,11 @@ class ImageServer:
                     cam_type = "isaacsim"
                 img_shape = cam_cfg.get("image_shape", None)
                 fps = cam_cfg.get("fps", 30)
-                video_id = cam_cfg.get("video_id", "0")
-                video_path = f"/dev/video{video_id}" if video_id else None
+                fourcc = cam_cfg.get("fourcc", "MJPG")  # None / "" = use camera native format
+                video_id = cam_cfg.get("video_id", None)
+                # NOTE: must compare to None — `video_id: 0` is a legitimate value
+                # but is falsy under a bare bool check.
+                video_path = f"/dev/video{video_id}" if video_id is not None else None
                 physical_path = str(cam_cfg.get("physical_path")) if cam_cfg.get("physical_path") else None
                 serial_number = str(cam_cfg.get("serial_number")) if cam_cfg.get("serial_number") else None
 
@@ -1241,8 +1256,9 @@ class ImageServer:
                             self._cameras[cam_topic] = None
                             logger_mp.error(f"[Image Server] Cannot find OpenCVCamera for {cam_topic} with physical path {physical_path}")
                         else:
-                            self._cameras[cam_topic] = OpenCVCamera(cam_topic, vpath, img_shape, fps, 
-                                                                    enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
+                            self._cameras[cam_topic] = OpenCVCamera(cam_topic, vpath, img_shape, fps,
+                                                                    enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec,
+                                                                    fourcc=fourcc)
                             continue
 
                     if serial_number is not None:
@@ -1251,18 +1267,20 @@ class ImageServer:
                             self._cameras[cam_topic] = None
                             logger_mp.error(f"[Image Server] Cannot find OpenCVCamera for {cam_topic} with serial number {serial_number}")
                         else:
-                            self._cameras[cam_topic] = OpenCVCamera(cam_topic, vpath, img_shape, fps, 
-                                                                    enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
+                            self._cameras[cam_topic] = OpenCVCamera(cam_topic, vpath, img_shape, fps,
+                                                                    enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec,
+                                                                    fourcc=fourcc)
                         # once you specify either `physical_path` or `serial_number`, the system will no longer fall back to searching by `video_id`.
                         # ——— even if no camera matches the given path/serial.
                         continue
-                    
+
                     if not self._cam_finder.is_vpath_exist(video_path):
                         self._cameras[cam_topic] = None
                         logger_mp.error(f"[Image Server] Cannot find OpenCVCamera for {cam_topic} with video_id {video_id}")
                     else:
                         self._cameras[cam_topic] = OpenCVCamera(cam_topic, video_path, img_shape, fps,
-                                                                enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
+                                                                enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec,
+                                                                fourcc=fourcc)
                         
 
                 elif cam_type == "realsense":
@@ -1548,13 +1566,81 @@ def main():
         logger_mp.error(f"Failed to load configuration file at {CONFIG_PATH}: {e}")
         exit(1)
 
-    # start image server
-    server = ImageServer(cam_config, realsense_enable=args.rs, camera_finder_verbose=False)
+    # start image server. Pass camera_finder_verbose=True so the operator
+    # gets the full --cf-style camera discovery dump as part of the normal
+    # startup log (single CameraFinder instance — running it twice was
+    # observed to hold device file descriptors and break OpenCV opens).
+    server = ImageServer(cam_config, realsense_enable=args.rs, camera_finder_verbose=True)
     server.start()
 
     # graceful shutdown handling
     signal.signal(signal.SIGINT, functools.partial(signal_handler, server))
     signal.signal(signal.SIGTERM, functools.partial(signal_handler, server))
+
+    # ---- Camera readiness summary -------------------------------------
+    # Print one line per camera declared in cam_config_server.yaml plus a
+    # final tally so the operator can confirm what is actually streaming
+    # before launching downstream clients (eval scripts, teleop, etc.).
+    ready_count = 0
+    failed_count = 0
+    disabled_count = 0
+    summary_lines = ["", "================ Camera Readiness Summary ================"]
+    for cam_topic, cam_cfg in cam_config.items():
+        enable_zmq = bool(cam_cfg.get("enable_zmq", False))
+        enable_webrtc = bool(cam_cfg.get("enable_webrtc", False))
+        cam_type = cam_cfg.get("type", "uvc")
+        video_id = cam_cfg.get("video_id", None)
+        serial = cam_cfg.get("serial_number", None)
+        zmq_port = cam_cfg.get("zmq_port", None)
+        webrtc_port = cam_cfg.get("webrtc_port", None)
+        identity = (
+            f"video_id={video_id}" if video_id is not None
+            else (f"sn={serial}" if serial is not None else "?")
+        )
+
+        if not (enable_zmq or enable_webrtc):
+            disabled_count += 1
+            summary_lines.append(
+                f"  [--] {cam_topic:<22} disabled in cam_config_server.yaml"
+            )
+            continue
+
+        camera = server._cameras.get(cam_topic)
+        is_ready = (
+            camera is not None
+            and getattr(camera, "_ready", None) is not None
+            and camera._ready.is_set()
+        )
+        transports = []
+        if enable_zmq:
+            transports.append(f"ZMQ:{zmq_port}")
+        if enable_webrtc:
+            transports.append(f"WebRTC:{webrtc_port}")
+        transport_str = ", ".join(transports)
+
+        if is_ready:
+            ready_count += 1
+            tag = "[OK]"
+        else:
+            failed_count += 1
+            tag = "[XX]"
+        summary_lines.append(
+            f"  {tag} {cam_topic:<22} type={cam_type:<8} {identity:<14} {transport_str}"
+        )
+
+    summary_lines.append("-----------------------------------------------------------")
+    summary_lines.append(
+        f"  ready: {ready_count}   failed: {failed_count}   disabled: {disabled_count}"
+    )
+    summary_lines.append("===========================================================")
+    logger_mp.info("\n".join(summary_lines))
+
+    if failed_count > 0:
+        logger_mp.warning(
+            f"[Image Server] {failed_count} camera(s) failed to become ready. "
+            "Check the camera connections, video_id / serial_number / physical_path, "
+            "and 'enable_zmq' flags in cam_config_server.yaml."
+        )
 
     logger_mp.info("[Image Server] Running... Press Ctrl+C to exit.")
     server.wait()
