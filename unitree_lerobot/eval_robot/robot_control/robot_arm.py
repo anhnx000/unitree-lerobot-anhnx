@@ -177,22 +177,20 @@ class G1_29_ArmController:
         return clipped_arm_q_target
 
     def _ctrl_motor_state(self):
-        # In motion_mode the arm_sdk weight (kNotUsedJoint0) selects between
-        # the motion-control service's command and our SDK command:
-        #   executed = motion_cmd * (1 - w) + sdk_cmd * w
-        # Slamming w=1.0 on the first tick causes "high-speed motion" if the
-        # two commands disagree (Unitree xr_teleoperate Motion docs). Ramp
-        # linearly over ramp_ticks ticks (~1 s @ 250 Hz) so the takeover is
-        # smooth even if the operator placed the arm far from the SDK target.
-        ramp_ticks = 250 if self.motion_mode else 0
-        tick = 0
+        # arm_sdk weight (kNotUsedJoint0): executed = motion_cmd*(1-w) + sdk_cmd*w.
+        # We slam w=1.0 on tick 0 (not ramped) because:
+        #   * the operator places the arm by hand in damping mode (L2+B) before
+        #     launching the script, so motion_cmd is "no torque" not "hold pose";
+        #     ramping w from 0 means the arm spends the ramp window under damping
+        #     and drops under gravity.
+        #   * q_target is seeded with the current sensed pose in __init__, so
+        #     sdk_cmd already matches where the arm physically is, making the
+        #     instant handover smooth without an explicit ramp.
+        if self.motion_mode:
+            self.msg.motor_cmd[G1_29_JointIndex.kNotUsedJoint0].q = 1.0
 
         while True:
             start_time = time.time()
-
-            if self.motion_mode:
-                w = 1.0 if tick >= ramp_ticks else tick / ramp_ticks
-                self.msg.motor_cmd[G1_29_JointIndex.kNotUsedJoint0].q = w
 
             with self.ctrl_lock:
                 arm_q_target = self.q_target
@@ -215,7 +213,6 @@ class G1_29_ArmController:
                 t_elapsed = start_time - self._gradual_start_time
                 self.arm_velocity_limit = 20.0 + (10.0 * min(1.0, t_elapsed / 5.0))
 
-            tick += 1
             current_time = time.time()
             all_t_elapsed = current_time - start_time
             sleep_time = max(0, (self.control_dt - all_t_elapsed))
@@ -486,18 +483,15 @@ class G1_23_ArmController:
         return clipped_arm_q_target
 
     def _ctrl_motor_state(self):
-        # See G1_29_ArmController._ctrl_motor_state for why the arm_sdk
-        # weight (kNotUsedJoint0) is ramped 0 -> 1 over ~1 s instead of
-        # being slammed to 1.0 on the first tick.
-        ramp_ticks = 250 if self.motion_mode else 0
-        tick = 0
+        # See G1_29_ArmController._ctrl_motor_state for the rationale: slam
+        # arm_sdk weight to 1.0 immediately because the operator pre-positions
+        # the arm by hand in damping mode, and q_target is already seeded with
+        # the sensed pose in __init__.
+        if self.motion_mode:
+            self.msg.motor_cmd[G1_23_JointIndex.kNotUsedJoint0].q = 1.0
 
         while True:
             start_time = time.time()
-
-            if self.motion_mode:
-                w = 1.0 if tick >= ramp_ticks else tick / ramp_ticks
-                self.msg.motor_cmd[G1_23_JointIndex.kNotUsedJoint0].q = w
 
             with self.ctrl_lock:
                 arm_q_target = self.q_target
@@ -520,7 +514,6 @@ class G1_23_ArmController:
                 t_elapsed = start_time - self._gradual_start_time
                 self.arm_velocity_limit = 20.0 + (10.0 * min(1.0, t_elapsed / 5.0))
 
-            tick += 1
             current_time = time.time()
             all_t_elapsed = current_time - start_time
             sleep_time = max(0, (self.control_dt - all_t_elapsed))
