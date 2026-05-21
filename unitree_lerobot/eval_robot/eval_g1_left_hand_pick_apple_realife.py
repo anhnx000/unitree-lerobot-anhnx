@@ -39,8 +39,12 @@ from __future__ import annotations
 import argparse
 import collections
 import math
+import select
+import sys
+import termios
 import threading
 import time
+import tty
 from typing import Any
 
 import msgpack_numpy as mnp
@@ -61,8 +65,24 @@ logger_mp.setLevel(logging_mp.INFO)
 
 # ---- Conventions copied from the openloop script --------------------------
 LA_DIM = 7   # left arm joints
+RA_DIM = 7   # right arm joints
 LH_DIM = 7   # left hand joints (dex3)
 DEFAULT_TASK = "pick apple and put in the box"
+
+# ---- Physical-arm mapping (THIS UNIT'S SDK ENUM IS MIRRORED) -------------
+# Empirical verification 2026-05-21 (multiple slew tests, debug log
+# correlation with the wrist-camera landmark):
+#   - With standard mapping (LEFT_ARM_SLICE = slice(0, 7)), applying
+#     LEFT_ARM_TRAIN_INIT (elbow=90°) to motor[15-21] physically bent the
+#     arm WITHOUT the wrist camera (= robot's RIGHT arm).
+#   - The model's "left_arm" output therefore needs to land on motor[22-28]
+#     (which is wired to robot's LEFT arm on this unit) for the camera-
+#     bearing arm to do the picking motion.
+# Conclusion: the SDK enum G1_29_JointArmIndex is mirrored on this hardware
+# revision (motor[15-21] labeled "kLeftXxx" is actually wired to physical
+# right). We compensate at the script layer with these slice constants.
+LEFT_ARM_SLICE  = slice(0, LA_DIM)                   # picking arm = motor[15-21] = arm WITH cam
+RIGHT_ARM_SLICE = slice(LA_DIM, LA_DIM + RA_DIM)     # idle arm    = motor[22-28] = arm WITHOUT cam
 
 # ---- Training-data init pose ---------------------------------------------
 # Mean of frame-0 left-arm state across 50 training episodes of
@@ -75,7 +95,7 @@ LEFT_ARM_TRAIN_INIT = np.array([
     -0.18,   # shoulder-pitch  (slightly tilted back / up)
     +0.04,   # shoulder-roll
     +0.17,   # shoulder-yaw
-    +0.48,   # elbow            (bent ~27°)
+    +0.00,   # elbow
     +0.04,   # wrist-roll
     -0.52,   # wrist-pitch
     +0.25,   # wrist-yaw
@@ -89,10 +109,31 @@ LEFT_HAND_TRAIN_INIT = np.array([
     -0.46,
     +0.80,
     +0.04,
-    -0.50,
+    +0.00,
     -0.08,
     -0.49,
     -0.09,
+], dtype=np.float64)
+
+# Right-arm rest pose. The user's task is LEFT-handed; the model does not
+# consume right_arm (new_embodiment state only includes left_arm +
+# left_hand), so the right arm pose is chosen purely for physical
+# convenience.
+#
+# Values = MEAN across all 102,462 training frames (261 episodes) — the
+# right arm is essentially HELD STILL throughout training (std ≤ 0.075 per
+# joint), so this is the pose the operator parked it in. Matching it
+# guarantees the right arm sits exactly where the model was trained to
+# expect (relevant only for cam_high visual distribution, since the model
+# doesn't observe right_arm state directly).
+RIGHT_ARM_REST = np.array([
+    -0.13,   # shoulder-pitch
+    -0.03,   # shoulder-roll
+    +0.00,   # shoulder-yaw
+    +1.30,   # elbow             (operator-verified "arm straight down" pose)
+    -0.01,   # wrist-roll
+    +0.14,   # wrist-pitch
+    -0.01,   # wrist-yaw
 ], dtype=np.float64)
 
 # ---- Safety limits for the LEFT arm only (right side is untouched) -------
@@ -524,6 +565,88 @@ def inference_worker(policy: RawPolicyClient, buffer: ChunkBuffer,
         buffer.publish(la_abs, lh_abs, t_obs)
 
 
+def stdin_quit_listener(quit_event: threading.Event) -> None:
+    """Daemon: set quit_event when user presses 'q' on stdin (no Enter needed).
+
+    Switches stdin to cbreak mode (line-buffering off + echo off) so a single
+    keystroke triggers the slew-back. Polls via select.select with a 100 ms
+    timeout so the loop also wakes up to check `quit_event` and exit cleanly
+    when main shuts down.
+
+    Caller (main) is responsible for restoring the original terminal mode
+    in its finally block — this listener changes tty flags but does NOT
+    restore them on exit, because daemon threads can be killed abruptly
+    before their own finally runs, leaving the terminal broken.
+
+    If stdin isn't a TTY (pipe / redirect / IDE without pty), the listener
+    no-ops and falls back to Ctrl+C as the only abort path.
+    """
+    if not sys.stdin.isatty():
+        logger_mp.warning("[input] stdin is not a TTY; 'q' hotkey disabled — "
+                          "use Ctrl+C to abort.")
+        return
+    try:
+        tty.setcbreak(sys.stdin.fileno())
+    except Exception as e:
+        logger_mp.error(f"[input-listener] failed to enter cbreak mode: {e}")
+        return
+    while not quit_event.is_set():
+        r, _, _ = select.select([sys.stdin], [], [], 0.1)
+        if not r:
+            continue
+        try:
+            ch = sys.stdin.read(1)
+        except Exception:
+            break
+        if not ch:                    # EOF
+            break
+        if ch.lower() == "q":
+            logger_mp.info("[input] 'q' pressed — initiating slew back to init pose")
+            quit_event.set()
+            break
+
+
+def slew_back_to_init(arm_ctrl, ee_shared, ctrl_state: "ControlState",
+                      init_full_arm: np.ndarray,
+                      left_hand_init: np.ndarray,
+                      right_hand_init: np.ndarray,
+                      period: float,
+                      secs: float = 2.0) -> None:
+    """Linearly slew the dual arm + both hands from the current sensed pose
+    back to the start-of-deployment init pose via ctrl_state.
+
+    Writes go through ctrl_state — the hold_pose_loop daemon picks them up
+    at 50 Hz and forwards to arm_ctrl + ee_shared, so no extra UDP socket
+    is opened and there's no risk of conflicting with the live hold stream.
+    Exceptions are logged but never re-raised; finally already runs.
+    """
+    try:
+        current_full_arm = np.asarray(arm_ctrl.get_current_dual_arm_q(),
+                                      dtype=np.float64)
+        with ee_shared["lock"]:
+            current_lh = np.array(ee_shared["state"][:len(left_hand_init)],
+                                  dtype=np.float64)
+        n_steps = max(1, int(round(secs / period)))
+        logger_mp.info(f"[shutdown] slewing back to init over {n_steps} ticks "
+                       f"({secs:.1f}s @ {1.0/period:.1f} Hz)")
+        for i in range(1, n_steps + 1):
+            t = time.perf_counter()
+            w = i / float(n_steps)
+            cmd_arm = (1.0 - w) * current_full_arm + w * init_full_arm
+            cmd_lh  = (1.0 - w) * current_lh        + w * left_hand_init
+            try:
+                ctrl_state.set_arm(cmd_arm)
+                ctrl_state.set_hands(cmd_lh, right_hand_init)
+            except Exception as e:
+                logger_mp.error(f"[shutdown-slew] tick {i}: {e}")
+            time.sleep(max(0.0, period - (time.perf_counter() - t)))
+        ctrl_state.set_arm(init_full_arm)
+        ctrl_state.set_hands(left_hand_init, right_hand_init)
+        logger_mp.info("[shutdown] back at init pose")
+    except Exception as e:
+        logger_mp.error(f"[shutdown-slew] failed: {e}")
+
+
 def main():
     args = parse_args()
 
@@ -569,31 +692,31 @@ def main():
     if ee_dof != LH_DIM:
         raise SystemExit(f"ee_dof={ee_dof} does not match left_hand dim {LH_DIM}")
 
-    # ---- Initial pose: snap left arm to training-data init -------------
+    # ---- Initial pose: snap left arm + right arm to training-data init -
     # We must put the left arm into a pose the policy actually saw during
-    # training before we let it close the loop. Right arm is left alone.
+    # training before we let it close the loop. The right arm is also slewed
+    # to its training rest pose (folded, tucked at side) so it doesn't poke
+    # into the cam_high view and feed the model OOD pixels.
     current_full_arm = np.asarray(arm_ctrl.get_current_dual_arm_q(), dtype=np.float64)
     init_full_arm = current_full_arm.copy()
     if args.init_pose == "training":
-        init_full_arm[:LA_DIM] = LEFT_ARM_TRAIN_INIT
+        init_full_arm[LEFT_ARM_SLICE] = LEFT_ARM_TRAIN_INIT
+        init_full_arm[RIGHT_ARM_SLICE] = RIGHT_ARM_REST
     logger_mp.info(
-        f"[init] mode={args.init_pose}  "
-        f"current_left_arm={current_full_arm[:LA_DIM].tolist()}  "
-        f"target_left_arm={init_full_arm[:LA_DIM].tolist()}"
+        f"[init] mode={args.init_pose}\n"
+        f"  current_left_arm  ={current_full_arm[LEFT_ARM_SLICE].tolist()}\n"
+        f"  target_left_arm   ={init_full_arm[LEFT_ARM_SLICE].tolist()}\n"
+        f"  current_right_arm ={current_full_arm[RIGHT_ARM_SLICE].tolist()}\n"
+        f"  target_right_arm  ={init_full_arm[RIGHT_ARM_SLICE].tolist()}"
     )
 
-    user_input = input("Enter 's' to start closed-loop GR00T evaluation: ")
-    if user_input.lower() != "s":
-        logger_mp.info("aborted by user")
-        return
-
     # ---- Threading setup -----------------------------------------------
-    # Start the hold-pose daemon BEFORE the slew so the motor is fed a
-    # continuous command stream end-to-end (init → slew → settle → loop →
-    # inference gaps). The control loop never touches the hardware directly;
-    # it only updates ctrl_state.
-    # Read the actual current left_hand pose so the slew doesn't start
-    # from `0` (which is OOD — see LEFT_HAND_TRAIN_INIT comment).
+    # Hold-pose daemon must run BEFORE the slew so the motor is fed a
+    # continuous command stream all the way: slew → prompt wait → loop →
+    # inference gaps → shutdown slew. The control loop never touches the
+    # hardware directly; it only updates ctrl_state.
+    # Read the actual current left_hand pose so the slew doesn't start from
+    # `0` (OOD — see LEFT_HAND_TRAIN_INIT comment).
     with ee_shared["lock"]:
         full_ee_state_init = np.array(ee_shared["state"][:], dtype=np.float64)
     current_left_hand  = full_ee_state_init[:LH_DIM].copy()
@@ -613,40 +736,99 @@ def main():
         args=(policy, chunk_buffer, stop_event),
         name="gr00t-infer", daemon=True,
     )
-    hold_thread.start()
-    infer_thread.start()
-    logger_mp.info(f"[threads] hold@{args.hold_hz:.0f}Hz + gr00t-infer started")
+    # Listener-related: created here so the finally block can always
+    # safely reference them, but listener thread + cbreak mode are only
+    # activated AFTER the user presses 's' (so input() above runs in
+    # canonical mode).
+    quit_event = threading.Event()
+    _old_termios = None
+    listener_thread: threading.Thread | None = None
+    infer_started = False
 
     period = 1.0 / float(args.frequency)
     n_queries = 0
     t_query_total = 0.0
     step = 0
+    end_lh = (LEFT_HAND_TRAIN_INIT.copy() if args.init_pose == "training"
+              else current_left_hand.copy())
 
     try:
-        # ---- Slew left arm to training-data init via ctrl_state --------
-        # The hold thread keeps resending whatever ctrl_state currently
-        # holds, so we only need to advance the target pose at the control
-        # rate — no direct ctrl_dual_arm() calls from this thread.
+        # Start hold thread now so motors are continuously fed from this
+        # point until shutdown (no sag during the slew or the prompt wait).
+        hold_thread.start()
+        logger_mp.info(f"[threads] hold@{args.hold_hz:.0f}Hz started")
+
+        # ---- Slew to preparation pose BEFORE the 's' prompt ----------
+        # User sees the robot physically move into the training-init pose
+        # so they can verify visually (cam_high frame matches training
+        # distribution, arms in correct posture) BEFORE committing to
+        # closed-loop. Abort with Ctrl+C if anything looks wrong.
         n_init_steps = max(1, int(round(args.init_pose_secs * args.frequency)))
-        start_left = current_full_arm[:LA_DIM].copy()
-        end_left   = init_full_arm[:LA_DIM].copy()
-        start_lh   = current_left_hand.copy()
-        end_lh     = LEFT_HAND_TRAIN_INIT.copy() if args.init_pose == "training" else current_left_hand.copy()
-        logger_mp.info(f"[init] slewing left arm + left hand over {n_init_steps} steps "
-                       f"({args.init_pose_secs:.1f}s @ {args.frequency:.1f}Hz)  "
-                       f"hand: {start_lh.tolist()} -> {end_lh.tolist()}")
+        start_left  = current_full_arm[LEFT_ARM_SLICE].copy()
+        end_left    = init_full_arm[LEFT_ARM_SLICE].copy()
+        start_right = current_full_arm[RIGHT_ARM_SLICE].copy()
+        end_right   = init_full_arm[RIGHT_ARM_SLICE].copy()
+        start_lh    = current_left_hand.copy()
+        logger_mp.info(
+            f"[init] slewing left+right arm + left hand over {n_init_steps} steps "
+            f"({args.init_pose_secs:.1f}s @ {args.frequency:.1f}Hz)\n"
+            f"  left_arm  : {start_left.tolist()} -> {end_left.tolist()}\n"
+            f"  right_arm : {start_right.tolist()} -> {end_right.tolist()}\n"
+            f"  left_hand : {start_lh.tolist()} -> {end_lh.tolist()}"
+        )
         for i in range(1, n_init_steps + 1):
             t = time.perf_counter()
             w = i / float(n_init_steps)
             cmd = init_full_arm.copy()
-            cmd[:LA_DIM] = (1.0 - w) * start_left + w * end_left
+            cmd[LEFT_ARM_SLICE] = (1.0 - w) * start_left + w * end_left
+            cmd[RIGHT_ARM_SLICE] = (1.0 - w) * start_right + w * end_right
             ctrl_state.set_arm(cmd)
             cur_lh = (1.0 - w) * start_lh + w * end_lh
             ctrl_state.set_hands(cur_lh, right_hand_zero)
             time.sleep(max(0.0, period - (time.perf_counter() - t)))
         ctrl_state.set_arm(init_full_arm)
         ctrl_state.set_hands(end_lh, right_hand_zero)
-        time.sleep(0.3)  # settle — hold thread keeps commanding init pose
+        # Longer settle so both arms actually reach their commanded positions
+        # before inference starts. With the previous 0.3s settle, an arm that
+        # started far from RIGHT_ARM_REST (e.g. elbow=1.36 before slew → 0
+        # commanded) may still be drifting toward its target when inference
+        # begins, producing apparent "movement" on the idle arm.
+        time.sleep(1.5)
+        # Log post-settle sensed arm positions to confirm both arms reached
+        # their targets. Large mismatch with init_full_arm = motor not done
+        # tracking yet → consider increasing init_pose_secs.
+        post_q = np.asarray(arm_ctrl.get_current_dual_arm_q(), dtype=np.float64)
+        logger_mp.info(
+            f"[init] post-settle sensed:\n"
+            f"  left_arm  ={post_q[LEFT_ARM_SLICE].tolist()}\n"
+            f"  right_arm ={post_q[RIGHT_ARM_SLICE].tolist()}\n"
+            f"  target was LEFT={init_full_arm[LEFT_ARM_SLICE].tolist()},\n"
+            f"             RIGHT={init_full_arm[RIGHT_ARM_SLICE].tolist()}"
+        )
+        logger_mp.info("[init] robot now at preparation pose — ready for prompt")
+
+        # ---- Prompt AFTER slew --------------------------------------
+        user_input = input("Robot at preparation pose. Enter 's' to start "
+                           "closed-loop GR00T evaluation (once running, "
+                           "press 'q' to slew back to init): ")
+        if user_input.lower() != "s":
+            logger_mp.info("aborted by user")
+            return    # finally cleans up hold_thread; slew_back is a no-op (already at init)
+
+        # ---- Activate raw stdin listener + start inference worker ---
+        if sys.stdin.isatty():
+            try:
+                _old_termios = termios.tcgetattr(sys.stdin.fileno())
+            except Exception as e:
+                logger_mp.warning(f"[input] cannot read termios state: {e}")
+        listener_thread = threading.Thread(
+            target=stdin_quit_listener, args=(quit_event,),
+            name="stdin-quit", daemon=True,
+        )
+        listener_thread.start()
+        infer_thread.start()
+        infer_started = True
+        logger_mp.info("[threads] gr00t-infer started")
 
         # ---- EMA + temporal-ensemble state ----------------------------
         ema_la: np.ndarray | None = None
@@ -677,7 +859,7 @@ def main():
             if current_arm_q is None:
                 return None, None, None, None
             current_arm_q = np.asarray(current_arm_q, dtype=np.float64)
-            left_arm_state = current_arm_q[:LA_DIM].astype(np.float32)
+            left_arm_state = current_arm_q[LEFT_ARM_SLICE].astype(np.float32)
             with ee_shared["lock"]:
                 full_ee_state = np.array(ee_shared["state"][:], dtype=np.float64)
             left_hand_state = full_ee_state[:LH_DIM].astype(np.float32)
@@ -724,9 +906,12 @@ def main():
                        f"{1000*(time.perf_counter()-boot_t_obs):.0f}ms, H={chunk_H}")
 
         # ---- Main control loop --------------------------------------
-        last_la_cmd = init_full_arm[:LA_DIM].copy()
+        last_la_cmd = init_full_arm[LEFT_ARM_SLICE].copy()
         last_lh_cmd = end_lh.copy()
         while True:
+            if quit_event.is_set():
+                logger_mp.info("[main] quit_event set, exiting closed-loop")
+                break
             loop_start = time.perf_counter()
 
             # ---- 1. Capture obs / state (cheap; needed for safety) ---
@@ -775,7 +960,7 @@ def main():
             # ---- 3c. Safety clamps ----------------------------------
             if not args.disable_safety:
                 la_cmd, abort_a, reason_a = safety_clamp(
-                    la_cmd, current_arm_q[:LA_DIM],
+                    la_cmd, current_arm_q[LEFT_ARM_SLICE],
                     LEFT_ARM_LIMITS_LOW, LEFT_ARM_LIMITS_HIGH,
                     args.arm_delta_cap, args.arm_abort, "left_arm",
                 )
@@ -790,7 +975,7 @@ def main():
 
             # ---- 4. Publish target to hold thread --------------------
             arm_cmd = init_full_arm.copy()             # right arm stays at init
-            arm_cmd[:LA_DIM] = la_cmd
+            arm_cmd[LEFT_ARM_SLICE] = la_cmd
             ctrl_state.set_arm(arm_cmd)
             ctrl_state.set_hands(lh_cmd, right_hand_zero)
             last_la_cmd = la_cmd.copy()
@@ -829,6 +1014,27 @@ def main():
                     f"| cmd roll={la_cmd[4]:+.3f} pitch={la_cmd[5]:+.3f} yaw={la_cmd[6]:+.3f}  "
                     f"| state roll={left_arm_state[4]:+.3f} pitch={left_arm_state[5]:+.3f} yaw={left_arm_state[6]:+.3f}"
                 )
+                # DEBUG: command vs sensed for both slices. If idle slice
+                # (RIGHT) is constant in cmd but the sensed value drifts,
+                # the motor is still tracking from a far-away start; bump
+                # init_pose_secs. If sensed left arm drifts from cmd, that's
+                # the picking arm following the model output (expected).
+                la_sp_cmd = arm_cmd[LEFT_ARM_SLICE][0]
+                ra_sp_cmd = arm_cmd[RIGHT_ARM_SLICE][0]
+                la_el_cmd = arm_cmd[LEFT_ARM_SLICE][3]
+                ra_el_cmd = arm_cmd[RIGHT_ARM_SLICE][3]
+                la_sp_st = current_arm_q[LEFT_ARM_SLICE][0]
+                ra_sp_st = current_arm_q[RIGHT_ARM_SLICE][0]
+                la_el_st = current_arm_q[LEFT_ARM_SLICE][3]
+                ra_el_st = current_arm_q[RIGHT_ARM_SLICE][3]
+                logger_mp.info(
+                    f"           LEFT  cmd shoulder_pitch={la_sp_cmd:+.3f} elbow={la_el_cmd:+.3f}  "
+                    f"| state shoulder_pitch={la_sp_st:+.3f} elbow={la_el_st:+.3f}"
+                )
+                logger_mp.info(
+                    f"           RIGHT cmd shoulder_pitch={ra_sp_cmd:+.3f} elbow={ra_el_cmd:+.3f}  "
+                    f"| state shoulder_pitch={ra_sp_st:+.3f} elbow={ra_el_st:+.3f}"
+                )
 
             if args.max_steps is not None and step >= args.max_steps:
                 logger_mp.info(f"reached max_steps={args.max_steps}, stopping")
@@ -842,9 +1048,31 @@ def main():
     except Exception as e:
         logger_mp.error(f"run failed: {e}", exc_info=True)
     finally:
+        # Stop the stdin listener and restore the terminal to canonical mode
+        # FIRST — the listener may be in cbreak (line-buffering off, echo off);
+        # leaving it that way would break the operator's shell after exit.
+        quit_event.set()
+        if _old_termios is not None:
+            try:
+                termios.tcsetattr(sys.stdin.fileno(),
+                                  termios.TCSADRAIN, _old_termios)
+            except Exception as e:
+                logger_mp.warning(f"[shutdown] failed to restore terminal: {e}")
+        # Slew BEFORE stopping the hold thread — the slew writes through
+        # ctrl_state, which only reaches the motor while hold_thread is alive.
+        # If the user aborted at the prompt the robot is already at init,
+        # so the lerp will be effectively a no-op (current ≈ target).
+        if hold_thread.is_alive():
+            slew_back_to_init(
+                arm_ctrl, ee_shared, ctrl_state,
+                init_full_arm, end_lh, right_hand_zero,
+                period, secs=2.0,
+            )
         stop_event.set()
-        hold_thread.join(timeout=2.0)
-        infer_thread.join(timeout=2.0)
+        if hold_thread.is_alive():
+            hold_thread.join(timeout=2.0)
+        if infer_started and infer_thread.is_alive():
+            infer_thread.join(timeout=2.0)
         logger_mp.info(f"[done] steps={step}  queries={n_queries}")
 
 

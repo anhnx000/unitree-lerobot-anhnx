@@ -1,26 +1,29 @@
 head_camera:
-  type: opencv
-  video_id: 0
-  image_shape: [480, 1280]
+  type: realsense
+  serial_number: "243722071431"   # Intel RealSense D435I
+  image_shape: [480, 640]         # training data was 480x640
   fps: 30
-  enable_zmq: false
+  binocular: false                # consumed by make_robot.py to skip the L/R split
+  enable_zmq: true
   zmq_port: 55555
   enable_webrtc: false
   webrtc_port: 66666
 left_wrist_camera:
-  type: opencv
-  video_id: 2
+  type: realsense
+  serial_number: "335122270157"   # Intel RealSense D405 (short-range, wrist-mounted)
   image_shape: [480, 640]
   fps: 30
-  enable_zmq: false
+  binocular: false
+  enable_zmq: true
   zmq_port: 55556
   enable_webrtc: false
   webrtc_port: 66667
 right_wrist_camera:
-  type: opencv
-  video_id: 4
+  type: realsense
+  serial_number: ""
   image_shape: [480, 640]
   fps: 30
+  binocular: false
   enable_zmq: false
   zmq_port: 55557
   enable_webrtc: false

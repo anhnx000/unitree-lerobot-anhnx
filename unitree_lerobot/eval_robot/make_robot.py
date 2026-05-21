@@ -186,8 +186,17 @@ def process_images_and_observations(img_client, camera_config, arm_ctrl):
         if camera_config['head_camera']['enable_zmq']:
             head_img = img_client.get_head_frame()
             if head_img is not None:
-                observation["observation.images.cam_left_high"] = to_tensor_rgb(head_img.bgr[:, :camera_config['head_camera']['image_shape'][1]//2])
-                observation["observation.images.cam_right_high"] = to_tensor_rgb(head_img.bgr[:, camera_config['head_camera']['image_shape'][1]//2:])
+                # If the head camera is a binocular stereo (1280-wide frame
+                # carrying both eyes side-by-side), split into cam_left_high
+                # and cam_right_high. Otherwise emit the full mono frame as
+                # cam_high — this matches LeRobot datasets recorded with a
+                # single head camera.
+                if camera_config['head_camera'].get('binocular', True):
+                    half = camera_config['head_camera']['image_shape'][1] // 2
+                    observation["observation.images.cam_left_high"] = to_tensor_rgb(head_img.bgr[:, :half])
+                    observation["observation.images.cam_right_high"] = to_tensor_rgb(head_img.bgr[:, half:])
+                else:
+                    observation["observation.images.cam_high"] = to_tensor_rgb(head_img.bgr)
             else:
                 logger_mp.warning("Head image is None!")
 
