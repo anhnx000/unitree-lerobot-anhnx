@@ -672,14 +672,14 @@ def main():
     if args.query_stride_ticks < 1:
         raise SystemExit(f"--query-stride-ticks must be >= 1, got {args.query_stride_ticks}")
 
-    # ---- GR00T server ----------------------------------------------------
-    policy = RawPolicyClient(args.policy_host, args.policy_port, timeout_ms=60000)
-    if not policy.ping():
-        raise SystemExit(f"GR00T server not reachable on {args.policy_host}:{args.policy_port}")
-    logger_mp.info(f"[server] ping ok at {args.policy_host}:{args.policy_port}")
-
-    # ---- Image + robot interfaces ---------------------------------------
-    image_client, image_config = setup_image_client(args)
+    # ---- Robot interface FIRST -----------------------------------------
+    # arm_ctrl's publish thread starts publishing as soon as it's
+    # constructed; we want the hold-pose daemon online before any slow
+    # network IO (policy ping / image handshake) can stretch out the
+    # window where the arm is left without commands matching the sensed
+    # pose. Controller-side fix (robot_arm.py: q_target seeded with the
+    # current sensed pose at construction) already prevents the drop, but
+    # this reordering is defense-in-depth.
     robot_interface = setup_robot_interface(args)
     arm_ctrl     = robot_interface["arm_ctrl"]
     arm_ik       = robot_interface["arm_ik"]
@@ -724,17 +724,11 @@ def main():
     ctrl_state = ControlState(current_full_arm, arm_ik, current_left_hand, right_hand_zero)
 
     stop_event = threading.Event()
-    chunk_buffer = ChunkBuffer()
 
     hold_thread = threading.Thread(
         target=hold_pose_loop,
         args=(arm_ctrl, ee_shared, ctrl_state, stop_event, args.hold_hz),
         name="hold-pose", daemon=True,
-    )
-    infer_thread = threading.Thread(
-        target=inference_worker,
-        args=(policy, chunk_buffer, stop_event),
-        name="gr00t-infer", daemon=True,
     )
     # Listener-related: created here so the finally block can always
     # safely reference them, but listener thread + cbreak mode are only
@@ -744,6 +738,7 @@ def main():
     _old_termios = None
     listener_thread: threading.Thread | None = None
     infer_started = False
+    infer_thread: threading.Thread | None = None
 
     period = 1.0 / float(args.frequency)
     n_queries = 0
@@ -755,8 +750,28 @@ def main():
     try:
         # Start hold thread now so motors are continuously fed from this
         # point until shutdown (no sag during the slew or the prompt wait).
+        # Crucially this runs BEFORE the slow policy / image client setup,
+        # so the arm is held at its sensed pose during those network IOs.
         hold_thread.start()
         logger_mp.info(f"[threads] hold@{args.hold_hz:.0f}Hz started")
+
+        # ---- GR00T server + image client (slow, network IO) ----------
+        # Done after hold_thread starts so any latency here doesn't leave
+        # the arm under the controller's default (sensed-pose-seeded)
+        # publish without the higher-frequency hold reinforcement.
+        policy = RawPolicyClient(args.policy_host, args.policy_port, timeout_ms=60000)
+        if not policy.ping():
+            raise SystemExit(f"GR00T server not reachable on {args.policy_host}:{args.policy_port}")
+        logger_mp.info(f"[server] ping ok at {args.policy_host}:{args.policy_port}")
+
+        image_client, image_config = setup_image_client(args)
+
+        chunk_buffer = ChunkBuffer()
+        infer_thread = threading.Thread(
+            target=inference_worker,
+            args=(policy, chunk_buffer, stop_event),
+            name="gr00t-infer", daemon=True,
+        )
 
         # ---- Slew to preparation pose BEFORE the 's' prompt ----------
         # User sees the robot physically move into the training-init pose

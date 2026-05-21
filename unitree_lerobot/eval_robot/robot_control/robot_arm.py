@@ -144,6 +144,12 @@ class G1_29_ArmController:
             self.msg.motor_cmd[id].q = self.all_motor_q[id]
         logger_mp.info("Lock OK!\n")
 
+        # Seed q_target with current sensed pose BEFORE the publish thread
+        # starts. Otherwise the daemon's first tick commands zeros (the
+        # constructor default) and the velocity-clipped slew toward zeros
+        # makes the arm drop out of whatever pose teleop / damping mode held.
+        self.q_target = self.get_current_dual_arm_q()
+
         # initialize publish thread
         self.publish_thread = threading.Thread(target=self._ctrl_motor_state)
         self.ctrl_lock = threading.Lock()
@@ -171,11 +177,22 @@ class G1_29_ArmController:
         return clipped_arm_q_target
 
     def _ctrl_motor_state(self):
-        if self.motion_mode:
-            self.msg.motor_cmd[G1_29_JointIndex.kNotUsedJoint0].q = 1.0
+        # In motion_mode the arm_sdk weight (kNotUsedJoint0) selects between
+        # the motion-control service's command and our SDK command:
+        #   executed = motion_cmd * (1 - w) + sdk_cmd * w
+        # Slamming w=1.0 on the first tick causes "high-speed motion" if the
+        # two commands disagree (Unitree xr_teleoperate Motion docs). Ramp
+        # linearly over ramp_ticks ticks (~1 s @ 250 Hz) so the takeover is
+        # smooth even if the operator placed the arm far from the SDK target.
+        ramp_ticks = 250 if self.motion_mode else 0
+        tick = 0
 
         while True:
             start_time = time.time()
+
+            if self.motion_mode:
+                w = 1.0 if tick >= ramp_ticks else tick / ramp_ticks
+                self.msg.motor_cmd[G1_29_JointIndex.kNotUsedJoint0].q = w
 
             with self.ctrl_lock:
                 arm_q_target = self.q_target
@@ -198,6 +215,7 @@ class G1_29_ArmController:
                 t_elapsed = start_time - self._gradual_start_time
                 self.arm_velocity_limit = 20.0 + (10.0 * min(1.0, t_elapsed / 5.0))
 
+            tick += 1
             current_time = time.time()
             all_t_elapsed = current_time - start_time
             sleep_time = max(0, (self.control_dt - all_t_elapsed))
@@ -435,6 +453,12 @@ class G1_23_ArmController:
             self.msg.motor_cmd[id].q = self.all_motor_q[id]
         logger_mp.info("Lock OK!\n")
 
+        # Seed q_target with current sensed pose BEFORE the publish thread
+        # starts. Same reasoning as G1_29: avoid the drop toward zero pose
+        # during the window between construction and the caller's first
+        # ctrl_dual_arm() call.
+        self.q_target = self.get_current_dual_arm_q()
+
         # initialize publish thread
         self.publish_thread = threading.Thread(target=self._ctrl_motor_state)
         self.ctrl_lock = threading.Lock()
@@ -462,11 +486,18 @@ class G1_23_ArmController:
         return clipped_arm_q_target
 
     def _ctrl_motor_state(self):
-        if self.motion_mode:
-            self.msg.motor_cmd[G1_23_JointIndex.kNotUsedJoint0].q = 1.0
+        # See G1_29_ArmController._ctrl_motor_state for why the arm_sdk
+        # weight (kNotUsedJoint0) is ramped 0 -> 1 over ~1 s instead of
+        # being slammed to 1.0 on the first tick.
+        ramp_ticks = 250 if self.motion_mode else 0
+        tick = 0
 
         while True:
             start_time = time.time()
+
+            if self.motion_mode:
+                w = 1.0 if tick >= ramp_ticks else tick / ramp_ticks
+                self.msg.motor_cmd[G1_23_JointIndex.kNotUsedJoint0].q = w
 
             with self.ctrl_lock:
                 arm_q_target = self.q_target
@@ -489,6 +520,7 @@ class G1_23_ArmController:
                 t_elapsed = start_time - self._gradual_start_time
                 self.arm_velocity_limit = 20.0 + (10.0 * min(1.0, t_elapsed / 5.0))
 
+            tick += 1
             current_time = time.time()
             all_t_elapsed = current_time - start_time
             sleep_time = max(0, (self.control_dt - all_t_elapsed))
@@ -712,6 +744,12 @@ class H1_2_ArmController:
                     self.msg.motor_cmd[id].kd = self.kd_high
             self.msg.motor_cmd[id].q = self.all_motor_q[id]
         logger_mp.info("Lock OK!\n")
+
+        # Seed q_target with current sensed pose BEFORE the publish thread
+        # starts. Same reasoning as G1_29: avoid the drop toward zero pose
+        # during the window between construction and the caller's first
+        # ctrl_dual_arm() call.
+        self.q_target = self.get_current_dual_arm_q()
 
         # initialize publish thread
         self.publish_thread = threading.Thread(target=self._ctrl_motor_state)
